@@ -6,6 +6,8 @@
 //   ENCRYPT: typed line is erased and re-typed as base64(nonce|AES-256-GCM ciphertext|tag)
 //   DECRYPT: typed line (base64) is erased and re-typed as plaintext (left alone if it fails)
 //   OFF:     plain keyboard
+// Bypass: with caps lock OFF while typing, press Caps Lock then Enter -> line sent as typed,
+//         caps lock turned back off.
 // Mode switch: GP14 to GND = encrypt, GP15 to GND = decrypt, neither (or both) = off.
 // `keycrypt mode ...` can override the switch (saved in flash); `keycrypt mode switch` hands control back.
 // Key is set over USB serial ("key <passphrase>") and saved in flash.
@@ -66,6 +68,11 @@ static KbReport prev = {};
 static bool suppressEnter = false;
 static uint8_t lastKey = 0;
 static uint32_t lastKeyAt = 0;
+// Caps-Lock bypass: caps OFF while typing, then Caps pressed (odd times) before Enter
+// -> send the line as-is and turn caps lock back off.
+static bool capsAtLastChar = false;
+static uint8_t capsToggles = 0;
+static bool restoreCaps = false;
 
 // =====================================================================
 // helpers
@@ -235,6 +242,7 @@ static void replaceLine(const char* text, size_t n) {
 
 // returns true if Enter was handled (and should not be forwarded)
 static bool onEnter() {
+  if (!capsAtLastChar && (capsToggles & 1)) { restoreCaps = true; return false; }  // caps bypass
   if (!cfg.hasKey || !tracking || lineLen == 0) return false;
   Mode m = readMode();
   if (m == MODE_ENCRYPT) {
@@ -252,7 +260,11 @@ static bool onEnter() {
   return false;
 }
 
-static void resetLine() { lineLen = 0; tracking = true; lastKey = 0; }
+static void resetLine() {
+  lineLen = 0; tracking = true; lastKey = 0;
+  capsAtLastChar = ledState & KEYBOARD_LED_CAPSLOCK;
+  capsToggles = 0;
+}
 
 static void handleReport(KbReport r) {
   bool ctrlAltGui = r.mod & ~(KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
@@ -278,8 +290,12 @@ static void handleReport(KbReport r) {
     if (c >= 32 && c < 127) {
       if ((ledState & KEYBOARD_LED_CAPSLOCK) && isalpha((unsigned char)c)) c ^= 0x20;
       if (lineLen < MAX_LINE) line[lineLen++] = c; else tracking = false;
+      capsAtLastChar = ledState & KEYBOARD_LED_CAPSLOCK;
+      capsToggles = 0;
       lastKey = k; lastKeyAt = millis();
-    } else if (k != HID_KEY_CAPS_LOCK) {
+    } else if (k == HID_KEY_CAPS_LOCK) {
+      capsToggles++;
+    } else {
       tracking = false;  // arrows, tab, esc, delete, etc
     }
   }
@@ -294,6 +310,21 @@ static void handleReport(KbReport r) {
   }
   sendReport(fwd.mod, fwd.keys);
   prev = r;
+  if (restoreCaps) {
+    restoreCaps = false;
+    delay(20);
+    // hold long enough that macOS doesn't ignore it as an accidental tap
+    uint8_t k[6] = { HID_KEY_CAPS_LOCK, 0, 0, 0, 0, 0 }, none[6] = { 0 };
+    sendReport(0, k);
+    delay(150);
+    sendReport(fwd.mod, none);
+    delay(5);
+    // restore what is physically held, minus Enter (it already went through once)
+    for (int i = 0; i < 6; i++)
+      if (fwd.keys[i] == HID_KEY_ENTER || fwd.keys[i] == HID_KEY_KEYPAD_ENTER) fwd.keys[i] = 0;
+    sendReport(fwd.mod, fwd.keys);
+    suppressEnter = true;  // keep Enter stripped until it is released
+  }
 }
 
 static void checkAutoRepeat() {
