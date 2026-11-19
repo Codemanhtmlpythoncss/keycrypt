@@ -6,8 +6,7 @@
 //   ENCRYPT: typed line is erased and re-typed as base64(nonce|AES-256-GCM ciphertext|tag)
 //   DECRYPT: typed line (base64) is erased and re-typed as plaintext (left alone if it fails)
 //   OFF:     plain keyboard
-// Bypass: with caps lock OFF while typing, press Caps Lock then Enter -> line sent as typed,
-//         caps lock turned back off.
+// Bypass: while Caps Lock is ON, Enter is sent normally (overrides CLI mode and switch).
 // Mode switch: GP14 to GND = encrypt, GP15 to GND = decrypt, neither (or both) = off.
 // `keycrypt mode ...` can override the switch (saved in flash); `keycrypt mode switch` hands control back.
 // Key is set over USB serial ("key <passphrase>") and saved in flash.
@@ -57,7 +56,12 @@ static char dbgProtos[24] = "";
 
 // ---------- settings (flash) ----------
 // modeOverride: 0 = follow switch, 1 = off, 2 = encrypt, 3 = decrypt (set from CLI)
-struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; uint8_t modeOverride; };
+// layout: 0 = US, 1 = UK.  os: 0 = mac, 1 = windows, 2 = linux  (how the COMPUTER is set up)
+struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; uint8_t modeOverride; uint8_t layout; uint8_t os; };
+static const char* const LAYOUT_NAME[] = { "us", "uk" };
+static const char* const OS_NAME[] = { "mac", "windows", "linux" };
+enum { OV_S = 1, OV_A = 2 };   // shift, alt/option
+struct Override { uint8_t mods; uint8_t key; char c; };
 static Settings cfg;
 
 // ---------- line tracking (core0) ----------
@@ -68,11 +72,6 @@ static KbReport prev = {};
 static bool suppressEnter = false;
 static uint8_t lastKey = 0;
 static uint32_t lastKeyAt = 0;
-// Caps-Lock bypass: caps OFF while typing, then Caps pressed (odd times) before Enter
-// -> send the line as-is and turn caps lock back off.
-static bool capsAtLastChar = false;
-static uint8_t capsToggles = 0;
-static bool restoreCaps = false;
 
 // =====================================================================
 // helpers
@@ -109,20 +108,66 @@ static void tapKey(uint8_t mod, uint8_t key) {
   delay(2);
 }
 
+// ---------- keyboard layouts ----------
+// Differences from US for the computer's layout. c = 0 means "not an ASCII char" (e.g. £).
+static const Override OV_UK_PC[] = {        // UK on Windows / Linux (ISO)
+  { OV_S, 0x1F, '"' }, { OV_S, 0x34, '@' }, { OV_S, 0x20, 0 },
+  { 0, 0x32, '#' }, { OV_S, 0x32, '~' }, { 0, 0x31, '#' }, { OV_S, 0x31, '~' },
+  { 0, 0x64, '\\' }, { OV_S, 0x64, '|' }, { OV_S, 0x35, 0 },
+};
+static const Override OV_UK_MAC[] = {       // "British" on macOS
+  { OV_S, 0x20, 0 }, { OV_A, 0x20, '#' },
+};
+
+static const Override* overrides(size_t& n) {
+  if (cfg.layout == 1 && cfg.os == 0) { n = sizeof OV_UK_MAC / sizeof *OV_UK_MAC; return OV_UK_MAC; }
+  if (cfg.layout == 1) { n = sizeof OV_UK_PC / sizeof *OV_UK_PC; return OV_UK_PC; }
+  n = 0; return nullptr;
+}
+
+// keycode + modifiers -> ASCII char the computer will produce, or 0 if unknown / not ASCII
+static char keyToChar(uint8_t k, uint8_t mod) {
+  if (mod & (KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTCTRL |
+             KEYBOARD_MODIFIER_LEFTGUI | KEYBOARD_MODIFIER_RIGHTGUI)) return 0;
+  uint8_t m = ((mod & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT)) ? OV_S : 0) |
+              ((mod & (KEYBOARD_MODIFIER_LEFTALT | KEYBOARD_MODIFIER_RIGHTALT)) ? OV_A : 0);
+  size_t n; const Override* ov = overrides(n);
+  for (size_t i = 0; i < n; i++) if (ov[i].key == k && ov[i].mods == m) return ov[i].c;
+  if ((m & OV_A) || k >= 128) return 0;
+  char c = keycode2ascii[k][m & OV_S ? 1 : 0];
+  return (c >= 32 && c < 127) ? c : 0;
+}
+
+// ASCII char -> keycode + modifiers for the computer's layout. false if not typeable.
+static bool charToKey(char c, uint8_t& mod, uint8_t& key) {
+  size_t n; const Override* ov = overrides(n);
+  for (size_t i = 0; i < n; i++) if (ov[i].c == c) {
+    key = ov[i].key;
+    mod = (ov[i].mods & OV_S ? KEYBOARD_MODIFIER_LEFTSHIFT : 0) | (ov[i].mods & OV_A ? KEYBOARD_MODIFIER_LEFTALT : 0);
+    return true;
+  }
+  if ((uint8_t)c >= 128 || !ascii2keycode[(uint8_t)c][1]) return false;
+  uint8_t s = ascii2keycode[(uint8_t)c][0] ? OV_S : 0;
+  key = ascii2keycode[(uint8_t)c][1];
+  for (size_t i = 0; i < n; i++) if (ov[i].key == key && ov[i].mods == s) return false;  // US key means something else here
+  mod = s ? KEYBOARD_MODIFIER_LEFTSHIFT : 0;
+  return true;
+}
+
 static void typeChar(char c) {
-  if ((uint8_t)c >= 128) return;
-  uint8_t shift = ascii2keycode[(uint8_t)c][0];
-  uint8_t kc = ascii2keycode[(uint8_t)c][1];
-  if (!kc) return;
+  uint8_t mod, kc;
+  if (!charToKey(c, mod, kc)) return;
   // computer caps lock flips letters
-  if ((ledState & KEYBOARD_LED_CAPSLOCK) && isalpha((unsigned char)c)) shift = !shift;
-  tapKey(shift ? KEYBOARD_MODIFIER_LEFTSHIFT : 0, kc);
+  if ((ledState & KEYBOARD_LED_CAPSLOCK) && isalpha((unsigned char)c)) mod ^= KEYBOARD_MODIFIER_LEFTSHIFT;
+  tapKey(mod, kc);
 }
 
 static void loadSettings() {
   EEPROM.get(0, cfg);
   if (cfg.magic != MAGIC) { memset(&cfg, 0, sizeof cfg); cfg.magic = MAGIC; }
   if (cfg.modeOverride > 3) cfg.modeOverride = 0;
+  if (cfg.layout > 1) cfg.layout = 0;
+  if (cfg.os > 2) cfg.os = 0;
 }
 
 static void saveSettings() {
@@ -242,7 +287,7 @@ static void replaceLine(const char* text, size_t n) {
 
 // returns true if Enter was handled (and should not be forwarded)
 static bool onEnter() {
-  if (!capsAtLastChar && (capsToggles & 1)) { restoreCaps = true; return false; }  // caps bypass
+  if (ledState & KEYBOARD_LED_CAPSLOCK) return false;  // caps lock on = bypass (beats CLI + switch)
   if (!cfg.hasKey || !tracking || lineLen == 0) return false;
   Mode m = readMode();
   if (m == MODE_ENCRYPT) {
@@ -262,13 +307,12 @@ static bool onEnter() {
 
 static void resetLine() {
   lineLen = 0; tracking = true; lastKey = 0;
-  capsAtLastChar = ledState & KEYBOARD_LED_CAPSLOCK;
-  capsToggles = 0;
 }
 
 static void handleReport(KbReport r) {
   bool ctrlAltGui = r.mod & ~(KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
-  bool shift = r.mod & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
+  bool ctrlGui = r.mod & (KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTCTRL |
+                          KEYBOARD_MODIFIER_LEFTGUI | KEYBOARD_MODIFIER_RIGHTGUI);
 
   for (int i = 0; i < 6; i++) {
     uint8_t k = r.keys[i];
@@ -279,24 +323,20 @@ static void handleReport(KbReport r) {
       resetLine();
       continue;
     }
-    if (ctrlAltGui) { tracking = false; continue; }   // shortcuts: can't know text
+    if (ctrlGui) { tracking = false; continue; }   // shortcuts: can't know text
     if (k == HID_KEY_BACKSPACE) {
       if (lineLen > 0) lineLen--;
       lastKey = k; lastKeyAt = millis();
       continue;
     }
 
-    char c = k < 128 ? keycode2ascii[k][shift ? 1 : 0] : 0;
-    if (c >= 32 && c < 127) {
+    char c = keyToChar(k, r.mod);
+    if (c) {
       if ((ledState & KEYBOARD_LED_CAPSLOCK) && isalpha((unsigned char)c)) c ^= 0x20;
       if (lineLen < MAX_LINE) line[lineLen++] = c; else tracking = false;
-      capsAtLastChar = ledState & KEYBOARD_LED_CAPSLOCK;
-      capsToggles = 0;
       lastKey = k; lastKeyAt = millis();
-    } else if (k == HID_KEY_CAPS_LOCK) {
-      capsToggles++;
-    } else {
-      tracking = false;  // arrows, tab, esc, delete, etc
+    } else if (k != HID_KEY_CAPS_LOCK && !(k >= HID_KEY_CONTROL_LEFT && k <= HID_KEY_GUI_RIGHT)) {
+      tracking = false;  // arrows, tab, esc, delete, £, option-combos, etc
     }
   }
 
@@ -310,21 +350,6 @@ static void handleReport(KbReport r) {
   }
   sendReport(fwd.mod, fwd.keys);
   prev = r;
-  if (restoreCaps) {
-    restoreCaps = false;
-    delay(20);
-    // hold long enough that macOS doesn't ignore it as an accidental tap
-    uint8_t k[6] = { HID_KEY_CAPS_LOCK, 0, 0, 0, 0, 0 }, none[6] = { 0 };
-    sendReport(0, k);
-    delay(150);
-    sendReport(fwd.mod, none);
-    delay(5);
-    // restore what is physically held, minus Enter (it already went through once)
-    for (int i = 0; i < 6; i++)
-      if (fwd.keys[i] == HID_KEY_ENTER || fwd.keys[i] == HID_KEY_KEYPAD_ENTER) fwd.keys[i] = 0;
-    sendReport(fwd.mod, fwd.keys);
-    suppressEnter = true;  // keep Enter stripped until it is released
-  }
 }
 
 static void checkAutoRepeat() {
@@ -338,7 +363,7 @@ static void checkAutoRepeat() {
 static void updateLed() {
   Mode m = readMode();
   bool on = m == MODE_ENCRYPT || (m == MODE_DECRYPT && (millis() / 250) % 2);
-  digitalWrite(STATUS_LED, on && cfg.hasKey);
+  digitalWrite(STATUS_LED, on && cfg.hasKey && !(ledState & KEYBOARD_LED_CAPSLOCK));
 }
 
 // =====================================================================
@@ -347,9 +372,11 @@ static void updateLed() {
 static String cmdBuf;
 
 static void printStatus() {
-  Serial.printf("KeyCrypt: mode %s (%s), key %s, keyboard %s\r\n",
-                MODE_NAME[readMode()], cfg.modeOverride ? "set by CLI" : "from switch", cfg.hasKey ? "set" : "NOT SET",
+  Serial.printf("KeyCrypt: mode %s (%s)%s, key %s, keyboard %s\r\n",
+                MODE_NAME[readMode()], cfg.modeOverride ? "set by CLI" : "from switch",
+                (ledState & KEYBOARD_LED_CAPSLOCK) ? " [CAPS LOCK ON: bypassed]" : "", cfg.hasKey ? "set" : "NOT SET",
                 kbAddr ? "connected" : "not connected");
+  Serial.printf("  computer layout %s, os %s\r\n", LAYOUT_NAME[cfg.layout], OS_NAME[cfg.os]);
   if (dbgVid || dbgHidCount)
     Serial.printf("  usb device %04x:%04x, hid interfaces %u (protocols: %s), reports %lu\r\n",
                   dbgVid, dbgPid, dbgHidCount, dbgProtos, (unsigned long)dbgReports);
@@ -387,9 +414,19 @@ static void runCommand(String c) {
     else { Serial.println("usage: mode switch|off|encrypt|decrypt"); return; }
     saveSettings();
     printStatus();
+  } else if (c.startsWith("layout ")) {
+    String v = c.substring(7); v.trim(); v.toLowerCase();
+    if (v == "us") cfg.layout = 0; else if (v == "uk") cfg.layout = 1;
+    else { Serial.println("usage: layout us|uk"); return; }
+    saveSettings(); printStatus();
+  } else if (c.startsWith("os ")) {
+    String v = c.substring(3); v.trim(); v.toLowerCase();
+    if (v == "mac") cfg.os = 0; else if (v == "windows") cfg.os = 1; else if (v == "linux") cfg.os = 2;
+    else { Serial.println("usage: os mac|windows|linux"); return; }
+    saveSettings(); printStatus();
   } else if (c == "clearkey") { memset(cfg.key, 0, 32); cfg.hasKey = 0; saveSettings(); printStatus(); }
   else if (c.length()) {
-    Serial.println("commands: key <passphrase> | status | mode switch|off|encrypt|decrypt | test <text> | untest <b64> | clearkey");
+    Serial.println("commands: key <passphrase> | status | mode switch|off|encrypt|decrypt | layout us|uk | os mac|windows|linux | test <text> | untest <b64> | clearkey");
   }
 }
 

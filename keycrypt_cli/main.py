@@ -91,6 +91,14 @@ def cmd_mode(a):
     print(talk("mode " + a.mode))
 
 
+def cmd_layout(a):
+    print(talk("layout " + a.layout))
+
+
+def cmd_os(a):
+    print(talk("os " + a.os))
+
+
 def cmd_clearkey(a):
     print(talk("clearkey"))
 
@@ -139,6 +147,12 @@ def main():
     p = sub.add_parser("mode", help="set the mode from here (overrides the switch until 'mode switch')")
     p.add_argument("mode", choices=["switch", "off", "encrypt", "decrypt"])
     p.set_defaults(f=cmd_mode)
+    p = sub.add_parser("layout", help="keyboard layout the computer uses (us or uk)")
+    p.add_argument("layout", choices=["us", "uk"])
+    p.set_defaults(f=cmd_layout)
+    p = sub.add_parser("os", help="operating system of the computer (mac, windows, linux)")
+    p.add_argument("os", choices=["mac", "windows", "linux"])
+    p.set_defaults(f=cmd_os)
     sub.add_parser("clearkey", help="erase the key from the device").set_defaults(f=cmd_clearkey)
     p = sub.add_parser("decrypt", help="decrypt text (args or stdin)")
     p.add_argument("text", nargs="*")
