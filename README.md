@@ -118,8 +118,15 @@ To update later, run `keycrypt flash` again. BOOTSEL isn't needed after the firs
 
 ## 5. Set your key
 
-Pick **one** of these. All keys are made on your computer with scrypt (memory-hard), and only the
-finished 256-bit key goes to the Pico's flash, so it survives unplugging.
+Pick **one** of these. The key is stored in the Pico's flash, so it survives unplugging.
+
+**Default: passphrase** (the same passphrase decrypts on any computer):
+```bash
+keycrypt setkey
+```
+Type it twice. It takes a few seconds: the key is worked out on the Pico with PBKDF2-SHA256
+(50 000 rounds). This is the simplest option, but a short or guessable passphrase can be
+dictionary-attacked, so use a long one (5+ random words).
 
 **Strongest: a random key** (no passphrase to guess, so no dictionary attack is possible):
 ```bash
@@ -131,17 +138,19 @@ keycrypt importkey KC2-ABCDE-FGHIJ-...
 ```
 Anyone with that string can read your messages, so hand it over in person, not over chat.
 
-**Default: passphrase + secret code:**
+**Passphrase + secret code:**
 ```bash
-keycrypt setkey
+keycrypt setkey --code
 ```
-Type a passphrase twice. KeyCrypt also makes a random 128-bit **secret code** and mixes it into the
-passphrase before scrypt. The way your key is encoded is then unique to you: without the code, a
-dictionary attack on your passphrase gets nowhere, even though this code is open source. Without the
-passphrase, the code alone is useless too. The code is saved on this computer (the passphrase never
-is) and printed as `KC2-…` for the other person to `keycrypt importkey`. They also need the passphrase.
+KeyCrypt makes a random 128-bit **secret code** and mixes it into your passphrase before scrypt
+(memory-hard). The way your key is encoded is then unique to you: without the code, a dictionary
+attack on your passphrase gets nowhere, even though this code is open source. The code is saved on
+this computer (the passphrase never is) and printed as `KC2-…`. To decrypt on another computer you
+need **both** the code (`keycrypt importkey`) and the passphrase. Back the code up: if you lose it,
+the passphrase alone can't decrypt.
 
-**Passphrase only:** `keycrypt setkey --plain`. **Old style** (PBKDF2 on the Pico, pre-1.6): `keycrypt setkey --pbkdf2`.
+**Passphrase with scrypt:** `keycrypt setkey --plain`. Like the default, the passphrase alone decrypts anywhere,
+but scrypt makes each guess far slower for an attacker than PBKDF2.
 
 ### Reading the key back
 
@@ -265,7 +274,7 @@ keycrypt encrypt "some secret"
 | Command | What it does |
 |---|---|
 | `keycrypt flash` | install or update the firmware |
-| `keycrypt setkey [--random\|--plain\|--pbkdf2]` | set the key (default: passphrase + secret code) |
+| `keycrypt setkey [--random\|--code\|--plain]` | set the key (default: passphrase, PBKDF2) |
 | `keycrypt readkey` | show the Pico's key as `KC2-…` (press BOOTSEL to allow) |
 | `keycrypt importkey KC2-… [--to-device]` | save a key or secret code you were given |
 | `keycrypt usbdump` | debug: what the keyboard's media keys / knob send |

@@ -245,7 +245,7 @@ def send_key(key: bytes, kid: bytes, kdf: int):
 
 
 def cmd_setkey(a):
-    if a.pbkdf2:
+    if not (a.random or a.plain or a.code):
         pw = ask_pass(confirm=True)
         print("saving key on device (takes a few seconds)...")
         print(talk("key " + pw, 8))
@@ -266,6 +266,7 @@ def cmd_setkey(a):
         send_key(scrypt_key(pw, kid), kid, 1)
         remember(kid)  # current key = passphrase-only, nothing secret stored
         return
+    # --code
     code = os.urandom(16)
     print("making key from passphrase + a new random secret code (scrypt)...")
     send_key(scrypt_key(pw, kid, code), kid, 3)
@@ -377,11 +378,12 @@ def cmd_flash(a):
 def main():
     ap = argparse.ArgumentParser(prog="keycrypt", description="Control the KeyCrypt Pico keyboard.")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("setkey", help="set the key on the device (default: passphrase + random secret code)")
+    p = sub.add_parser("setkey", help="set the key on the device (default: passphrase, PBKDF2 on the Pico)")
     g = p.add_mutually_exclusive_group()
+    g.add_argument("--code", action="store_true", help="passphrase + random secret code (blocks dictionary attacks)")
     g.add_argument("--random", action="store_true", help="truly random 256-bit key, no passphrase (strongest)")
     g.add_argument("--plain", action="store_true", help="passphrase only (scrypt), no secret code")
-    g.add_argument("--pbkdf2", action="store_true", help="old style: passphrase, PBKDF2 on the Pico")
+    g.add_argument("--pbkdf2", action="store_true", help="passphrase, PBKDF2 on the Pico (the default)")
     p.set_defaults(f=cmd_setkey)
     sub.add_parser("readkey", help="show the device's key as a KC2- string (press BOOTSEL on the Pico to allow)"
                    ).set_defaults(f=cmd_readkey)

@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>graphify - graphify-out/graph.html</title>
+<script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"
+        integrity="sha384-Ux6phic9PEHJ38YtrijhkzyJ8yQlH8i/+buBR8s3mAZOJrP1gwyvAcIYl3GWtpX1"
+        crossorigin="anonymous"></script>
+<style>
+  :root {
+    --bg: #0f0f1a; --panel: #1a1a2e; --border: #2a2a4e; --input-border: #3a3a5e;
+    --text: #e0e0e0; --text-2: #aaa; --text-3: #ccc; --muted: #555; --count: #666;
+    --neighbor-border: #333; --node-label: #ffffff;
+  }
+  [data-theme="light"] {
+    --bg: #ffffff; --panel: #f8f9fa; --border: #d9dee5; --input-border: #c3cad4;
+    --text: #222222; --text-2: #666666; --text-3: #333333; --muted: #888888; --count: #777777;
+    --neighbor-border: #ccc; --node-label: #222222;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; display: flex; height: 100vh; overflow: hidden; }
+  #graph { flex: 1; }
+  #sidebar { width: 280px; background: var(--panel); border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+  #search-wrap { padding: 12px; border-bottom: 1px solid var(--border); }
+  #search { width: 100%; background: var(--bg); border: 1px solid var(--input-border); color: var(--text); padding: 7px 10px; border-radius: 6px; font-size: 13px; outline: none; }
+  #search:focus { border-color: #4E79A7; }
+  #search-results { max-height: 140px; overflow-y: auto; padding: 4px 12px; border-bottom: 1px solid var(--border); display: none; }
+  .search-item { padding: 4px 6px; cursor: pointer; border-radius: 4px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .search-item:hover { background: var(--border); }
+  #info-panel { padding: 14px; border-bottom: 1px solid var(--border); min-height: 140px; }
+  #info-panel h3 { font-size: 13px; color: var(--text-2); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  #info-content { font-size: 13px; color: var(--text-3); line-height: 1.6; }
+  #info-content .field { margin-bottom: 5px; }
+  #info-content .field b { color: var(--text); }
+  #info-content .empty { color: var(--muted); font-style: italic; }
+  .neighbor-link { display: block; padding: 2px 6px; margin: 2px 0; border-radius: 3px; cursor: pointer; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-left: 3px solid var(--neighbor-border); }
+  .neighbor-link:hover { background: var(--border); }
+  #neighbors-list { max-height: 160px; overflow-y: auto; margin-top: 4px; }
+  #legend-wrap { flex: 1; overflow-y: auto; padding: 12px; }
+  #legend-wrap h3 { font-size: 13px; color: var(--text-2); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .legend-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; border-radius: 4px; font-size: 12px; }
+  .legend-item:hover { background: var(--border); padding-left: 4px; }
+  .legend-item.dimmed { opacity: 0.35; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .legend-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .legend-count { color: var(--count); font-size: 11px; }
+  #stats { padding: 10px 14px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+  #legend-controls { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; padding: 4px 0; }
+  #legend-controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; color: var(--text-2); user-select: none; }
+  #legend-controls label:hover { color: var(--text); }
+  .legend-cb, #select-all-cb { appearance: none; -webkit-appearance: none; width: 14px; height: 14px; border: 1.5px solid var(--input-border); border-radius: 3px; background: var(--bg); cursor: pointer; position: relative; flex-shrink: 0; }
+  .legend-cb:checked, #select-all-cb:checked { background: #4E79A7; border-color: #4E79A7; }
+  .legend-cb:checked::after, #select-all-cb:checked::after { content: ''; position: absolute; left: 3.5px; top: 1px; width: 4px; height: 7px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+  #select-all-cb:indeterminate { background: #4E79A7; border-color: #4E79A7; }
+  #select-all-cb:indeterminate::after { content: ''; position: absolute; left: 2px; top: 5px; width: 8px; height: 2px; background: #fff; border: none; transform: none; }
+  #theme-wrap { display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  #theme-wrap button { flex: 1; background: var(--bg); color: var(--text-2); border: 1px solid var(--input-border); border-radius: 4px; padding: 3px 0; font-size: 11px; cursor: pointer; }
+  #theme-wrap button:hover { color: var(--text); }
+  #theme-wrap button[aria-pressed="true"] { background: #4E79A7; border-color: #4E79A7; color: #fff; }
+</style>
+<script id="graphify-theme-init">
+// Apply the saved theme before first paint (#3894). No saved choice keeps the
+// historical dark look; "system" follows prefers-color-scheme.
+(function () {
+  var pref = null;
+  try { pref = localStorage.getItem('graphify-theme'); } catch (e) {}
+  var t = pref === 'light' ? 'light'
+    : pref === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light'
+    : 'dark';
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+</head>
+<body>
+<div id="graph"></div>
+<div id="sidebar">
+  <div id="theme-wrap" role="group" aria-label="Theme">
+    <button type="button" data-theme-choice="light">Light</button>
+    <button type="button" data-theme-choice="dark">Dark</button>
+    <button type="button" data-theme-choice="system">System</button>
+  </div>
+  <div id="search-wrap">
+    <input id="search" type="text" placeholder="Search nodes..." autocomplete="off">
+    <div id="search-results"></div>
+  </div>
+  <div id="info-panel">
+    <h3>Node Info</h3>
+    <div id="info-content"><span class="empty">Click a node to inspect it</span></div>
+  </div>
+  <div id="legend-wrap">
+    <h3>Communities</h3>
+    <div id="legend-controls">
+      <label><input type="checkbox" id="select-all-cb" checked onchange="toggleAllCommunities(!this.checked)">Select All</label>
+    </div>
+    <div id="legend"></div>
+  </div>
+  <div id="stats">75 nodes &middot; 158 edges &middot; 12 communities</div>
+</div>
+<script>
+const RAW_NODES = [{"id": "keycrypt_cli_main_keys", "label": "Keys", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 14.8, "font": {"size": 12, "color": "#ffffff"}, "title": "Keys", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 7}, {"id": "keycrypt_cli_main_cmd_decrypt", "label": "cmd_decrypt()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_decrypt()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 5}, {"id": "keycrypt_cli_main_cmd_encrypt", "label": "cmd_encrypt()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 15.5, "font": {"size": 12, "color": "#ffffff"}, "title": "cmd_encrypt()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 8}, {"id": "keycrypt_cli_main_inputs", "label": "inputs()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "inputs()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_keys_get", "label": ".get()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": ".get()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 5}, {"id": "keycrypt_cli_main_keys_init", "label": ".__init__()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 11.4, "font": {"size": 0, "color": "#ffffff"}, "title": ".__init__()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 2}, {"id": "keycrypt_cli_main_keys_passphrase", "label": ".passphrase()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": ".passphrase()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_pbkdf2_key", "label": "pbkdf2_key()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 12.7, "font": {"size": 0, "color": "#ffffff"}, "title": "pbkdf2_key()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 4}, {"id": "keycrypt_cli_main_scrypt_key", "label": "scrypt_key()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 14.1, "font": {"size": 0, "color": "#ffffff"}, "title": "scrypt_key()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 6}, {"id": "keycrypt_cli_main_seal", "label": "seal()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "seal()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 5}, {"id": "keycrypt_cli_main_subkeys", "label": "subkeys()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "subkeys()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_unseal", "label": "unseal()", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 14.1, "font": {"size": 0, "color": "#ffffff"}, "title": "unseal()", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 6}, {"id": "keycrypt_cli_main_cmd_cipher", "label": "cmd_cipher()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_cipher()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_cmd_clearkey", "label": "cmd_clearkey()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_clearkey()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_cmd_layout", "label": "cmd_layout()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_layout()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_cmd_mode", "label": "cmd_mode()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_mode()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_cmd_os", "label": "cmd_os()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_os()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_cmd_remap", "label": "cmd_remap()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_remap()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_cmd_status", "label": "cmd_status()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_status()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_cmd_usbdump", "label": "cmd_usbdump()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_usbdump()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_main", "label": "main()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 20.9, "font": {"size": 12, "color": "#ffffff"}, "title": "main()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 16}, {"id": "keycrypt_cli_main_talk", "label": "talk()", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 20.2, "font": {"size": 12, "color": "#ffffff"}, "title": "talk()", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 15}, {"id": "keycrypt_cli_main_cmd_flash", "label": "cmd_flash()", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 14.8, "font": {"size": 12, "color": "#ffffff"}, "title": "cmd_flash()", "community": 2, "community_name": "main.py", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 7}, {"id": "keycrypt_cli_main_find_bootdrive", "label": "find_bootdrive()", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "find_bootdrive()", "community": 2, "community_name": "main.py", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 3}, {"id": "keycrypt_cli_main_find_port", "label": "find_port()", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "find_port()", "community": 2, "community_name": "main.py", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 5}, {"id": "keycrypt_cli_main_cmd_readkey", "label": "cmd_readkey()", "color": {"background": "#59A14F", "border": "#59A14F", "highlight": {"background": "#ffffff", "border": "#59A14F"}}, "size": 14.1, "font": {"size": 0, "color": "#ffffff"}, "title": "cmd_readkey()", "community": 4, "community_name": "cmd_setkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 6}, {"id": "keycrypt_cli_main_cmd_setkey", "label": "cmd_setkey()", "color": {"background": "#59A14F", "border": "#59A14F", "highlight": {"background": "#ffffff", "border": "#59A14F"}}, "size": 17.5, "font": {"size": 12, "color": "#ffffff"}, "title": "cmd_setkey()", "community": 4, "community_name": "cmd_setkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 11}, {"id": "keycrypt_cli_main_export_string", "label": "export_string()", "color": {"background": "#59A14F", "border": "#59A14F", "highlight": {"background": "#ffffff", "border": "#59A14F"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "export_string()", "community": 4, "community_name": "cmd_setkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 5}, {"id": "keycrypt_cli_main_load_keyring", "label": "load_keyring()", "color": {"background": "#59A14F", "border": "#59A14F", "highlight": {"background": "#ffffff", "border": "#59A14F"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "load_keyring()", "community": 4, "community_name": "cmd_setkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 5}, {"id": "keycrypt_cli_main_remember", "label": "remember()", "color": {"background": "#59A14F", "border": "#59A14F", "highlight": {"background": "#ffffff", "border": "#59A14F"}}, "size": 14.1, "font": {"size": 0, "color": "#ffffff"}, "title": "remember()", "community": 4, "community_name": "cmd_setkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 6}, {"id": "keycrypt_cli_main_save_keyring", "label": "save_keyring()", "color": {"background": "#59A14F", "border": "#59A14F", "highlight": {"background": "#ffffff", "border": "#59A14F"}}, "size": 12.7, "font": {"size": 0, "color": "#ffffff"}, "title": "save_keyring()", "community": 4, "community_name": "cmd_setkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 4}, {"id": "keycrypt_cli_main_ask_pass", "label": "ask_pass()", "color": {"background": "#EDC948", "border": "#EDC948", "highlight": {"background": "#ffffff", "border": "#EDC948"}}, "size": 14.8, "font": {"size": 12, "color": "#ffffff"}, "title": "ask_pass()", "community": 5, "community_name": "cmd_importkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 7}, {"id": "keycrypt_cli_main_cmd_importkey", "label": "cmd_importkey()", "color": {"background": "#EDC948", "border": "#EDC948", "highlight": {"background": "#ffffff", "border": "#EDC948"}}, "size": 15.5, "font": {"size": 12, "color": "#ffffff"}, "title": "cmd_importkey()", "community": 5, "community_name": "cmd_importkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 8}, {"id": "keycrypt_cli_main_parse_export", "label": "parse_export()", "color": {"background": "#EDC948", "border": "#EDC948", "highlight": {"background": "#ffffff", "border": "#EDC948"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "parse_export()", "community": 5, "community_name": "cmd_importkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 5}, {"id": "keycrypt_cli_main_send_key", "label": "send_key()", "color": {"background": "#EDC948", "border": "#EDC948", "highlight": {"background": "#ffffff", "border": "#EDC948"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "send_key()", "community": 5, "community_name": "cmd_importkey", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 5}, {"id": "keycrypt_cli_main_rationale_128", "label": "Finds the key for a ciphertext: keyring first, passphrase only when needed\u2026", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Finds the key for a ciphertext: keyring first, passphrase only when needed\u2026", "community": 0, "community_name": "cmd_encrypt", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "rationale", "degree": 1}, {"id": "keycrypt_cli_main_rationale_219", "label": "Send a command. With `until`, read lines until one starts with a marker (or\u2026", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Send a command. With `until`, read lines until one starts with a marker (or\u2026", "community": 1, "community_name": "main", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "rationale", "degree": 1}, {"id": "keycrypt_cli_init", "label": "__init__.py", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 10.0, "font": {"size": 0, "color": "#ffffff"}, "title": "__init__.py", "community": 10, "community_name": "__init__.py", "source_file": "pico-desktop-encryptor/keycrypt_cli/__init__.py", "file_type": "code", "degree": 0}, {"id": "pkg_pico_desktop_encryptor", "label": "pico-desktop-encryptor", "color": {"background": "#F28E2B", "border": "#F28E2B", "highlight": {"background": "#ffffff", "border": "#F28E2B"}}, "size": 10.0, "font": {"size": 0, "color": "#ffffff"}, "title": "pico-desktop-encryptor", "community": 11, "community_name": "pico-desktop-encryptor", "source_file": "pico-desktop-encryptor/pyproject.toml", "file_type": "code", "degree": 0}, {"id": "keycrypt_cli_main", "label": "main.py", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 40.0, "font": {"size": 12, "color": "#ffffff"}, "title": "main.py", "community": 2, "community_name": "main.py", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "code", "degree": 44}, {"id": "keycrypt_cli_main_rationale_1", "label": "keycrypt - command line tool for the KeyCrypt Pico keyboard.", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "keycrypt - command line tool for the KeyCrypt Pico keyboard.", "community": 2, "community_name": "main.py", "source_file": "pico-desktop-encryptor/keycrypt_cli/main.py", "file_type": "rationale", "degree": 1}, {"id": "readme", "label": "README.md", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 11.4, "font": {"size": 0, "color": "#ffffff"}, "title": "README.md", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 2}, {"id": "readme_1_what_you_need", "label": "1. What you need", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "1. What you need", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_3_install_the_keycrypt_command", "label": "3. Install the `keycrypt` command", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "3. Install the `keycrypt` command", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_4_flash_the_pico", "label": "4. Flash the Pico", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "4. Flash the Pico", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_build_from_source", "label": "Build from source", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Build from source", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_ciphertext_format", "label": "Ciphertext format", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Ciphertext format", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_license", "label": "License", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "License", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_limits_read_these", "label": "Limits (read these)", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Limits (read these)", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_open_source", "label": "Open source", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Open source", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_pico_desktop_encryptor_keycrypt", "label": "pico-desktop-encryptor (KeyCrypt)", "color": {"background": "#76B7B2", "border": "#76B7B2", "highlight": {"background": "#ffffff", "border": "#76B7B2"}}, "size": 18.2, "font": {"size": 12, "color": "#ffffff"}, "title": "pico-desktop-encryptor (KeyCrypt)", "community": 3, "community_name": "pico-desktop-encryptor (KeyCrypt)", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 12}, {"id": "readme_5_set_your_key", "label": "5. Set your key", "color": {"background": "#B07AA1", "border": "#B07AA1", "highlight": {"background": "#ffffff", "border": "#B07AA1"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "5. Set your key", "community": 6, "community_name": "5. Set your key", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 5}, {"id": "readme_reading_the_key_back", "label": "Reading the key back", "color": {"background": "#B07AA1", "border": "#B07AA1", "highlight": {"background": "#ffffff", "border": "#B07AA1"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Reading the key back", "community": 6, "community_name": "5. Set your key", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_stronger_encryption", "label": "Stronger encryption", "color": {"background": "#B07AA1", "border": "#B07AA1", "highlight": {"background": "#ffffff", "border": "#B07AA1"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Stronger encryption", "community": 6, "community_name": "5. Set your key", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_tell_it_your_computer_s_layout_and_os", "label": "Tell it your computer's layout and OS", "color": {"background": "#B07AA1", "border": "#B07AA1", "highlight": {"background": "#ffffff", "border": "#B07AA1"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Tell it your computer's layout and OS", "community": 6, "community_name": "5. Set your key", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_windows_keyboard_on_a_mac", "label": "Windows keyboard on a Mac", "color": {"background": "#B07AA1", "border": "#B07AA1", "highlight": {"background": "#ffffff", "border": "#B07AA1"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Windows keyboard on a Mac", "community": 6, "community_name": "5. Set your key", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_6_use_it", "label": "6. Use it", "color": {"background": "#FF9DA7", "border": "#FF9DA7", "highlight": {"background": "#ffffff", "border": "#FF9DA7"}}, "size": 12.7, "font": {"size": 0, "color": "#ffffff"}, "title": "6. Use it", "community": 7, "community_name": "6. Use it", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 4}, {"id": "readme_all_commands", "label": "All commands", "color": {"background": "#FF9DA7", "border": "#FF9DA7", "highlight": {"background": "#ffffff", "border": "#FF9DA7"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "All commands", "community": 7, "community_name": "6. Use it", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_caps_lock_bypass", "label": "Caps Lock = bypass", "color": {"background": "#FF9DA7", "border": "#FF9DA7", "highlight": {"background": "#ffffff", "border": "#FF9DA7"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Caps Lock = bypass", "community": 7, "community_name": "6. Use it", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_decrypting_on_the_computer", "label": "Decrypting on the computer", "color": {"background": "#FF9DA7", "border": "#FF9DA7", "highlight": {"background": "#ffffff", "border": "#FF9DA7"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Decrypting on the computer", "community": 7, "community_name": "6. Use it", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_2_wiring", "label": "2. Wiring", "color": {"background": "#9C755F", "border": "#9C755F", "highlight": {"background": "#ffffff", "border": "#9C755F"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "2. Wiring", "community": 8, "community_name": "2. Wiring", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 3}, {"id": "readme_keyboard_socket_usb_a_female", "label": "Keyboard socket (USB-A female)", "color": {"background": "#9C755F", "border": "#9C755F", "highlight": {"background": "#ffffff", "border": "#9C755F"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Keyboard socket (USB-A female)", "community": 8, "community_name": "2. Wiring", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "readme_mode_switch", "label": "Mode switch", "color": {"background": "#9C755F", "border": "#9C755F", "highlight": {"background": "#ffffff", "border": "#9C755F"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "Mode switch", "community": 8, "community_name": "2. Wiring", "source_file": "pico-desktop-encryptor/README.md", "file_type": "document", "degree": 1}, {"id": "scripts_build_firmware", "label": "build-firmware.sh", "color": {"background": "#BAB0AC", "border": "#BAB0AC", "highlight": {"background": "#ffffff", "border": "#BAB0AC"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "build-firmware.sh", "community": 9, "community_name": "build-firmware.sh", "source_file": "pico-desktop-encryptor/scripts/build-firmware.sh", "file_type": "code", "degree": 1}, {"id": "scripts_build_firmware_sh__entry", "label": "build-firmware.sh script", "color": {"background": "#BAB0AC", "border": "#BAB0AC", "highlight": {"background": "#ffffff", "border": "#BAB0AC"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "build-firmware.sh script", "community": 9, "community_name": "build-firmware.sh", "source_file": "pico-desktop-encryptor/scripts/build-firmware.sh", "file_type": "code", "degree": 1}, {"id": "base64", "label": "base64", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "base64", "community": 0, "community_name": "cmd_encrypt", "source_file": "", "file_type": "concept", "degree": 5}, {"id": "hashlib", "label": "hashlib", "color": {"background": "#4E79A7", "border": "#4E79A7", "highlight": {"background": "#ffffff", "border": "#4E79A7"}}, "size": 13.4, "font": {"size": 0, "color": "#ffffff"}, "title": "hashlib", "community": 0, "community_name": "cmd_encrypt", "source_file": "", "file_type": "concept", "degree": 5}, {"id": "argparse", "label": "argparse", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 11.4, "font": {"size": 0, "color": "#ffffff"}, "title": "argparse", "community": 2, "community_name": "main.py", "source_file": "", "file_type": "concept", "degree": 2}, {"id": "glob", "label": "glob", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "glob", "community": 2, "community_name": "main.py", "source_file": "", "file_type": "concept", "degree": 3}, {"id": "importlib", "label": "importlib", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 10.7, "font": {"size": 0, "color": "#ffffff"}, "title": "importlib", "community": 2, "community_name": "main.py", "source_file": "", "file_type": "concept", "degree": 1}, {"id": "shutil", "label": "shutil", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 11.4, "font": {"size": 0, "color": "#ffffff"}, "title": "shutil", "community": 2, "community_name": "main.py", "source_file": "", "file_type": "concept", "degree": 2}, {"id": "time", "label": "time", "color": {"background": "#E15759", "border": "#E15759", "highlight": {"background": "#ffffff", "border": "#E15759"}}, "size": 12.0, "font": {"size": 0, "color": "#ffffff"}, "title": "time", "community": 2, "community_name": "main.py", "source_file": "", "file_type": "concept", "degree": 3}, {"id": "os", "label": "os", "color": {"background": "#59A14F", "border": "#59A14F", "highlight": {"background": "#ffffff", "border": "#59A14F"}}, "size": 12.7, "font": {"size": 0, "color": "#ffffff"}, "title": "os", "community": 4, "community_name": "cmd_setkey", "source_file": "", "file_type": "concept", "degree": 4}, {"id": "getpass", "label": "getpass", "color": {"background": "#EDC948", "border": "#EDC948", "highlight": {"background": "#ffffff", "border": "#EDC948"}}, "size": 11.4, "font": {"size": 0, "color": "#ffffff"}, "title": "getpass", "community": 5, "community_name": "cmd_importkey", "source_file": "", "file_type": "concept", "degree": 2}, {"id": "sys", "label": "sys", "color": {"background": "#EDC948", "border": "#EDC948", "highlight": {"background": "#ffffff", "border": "#EDC948"}}, "size": 15.5, "font": {"size": 12, "color": "#ffffff"}, "title": "sys", "community": 5, "community_name": "cmd_importkey", "source_file": "", "file_type": "concept", "degree": 8}];
+const RAW_EDGES = [{"from": "keycrypt_cli_main_cmd_decrypt", "to": "keycrypt_cli_main_keys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_unseal", "to": "keycrypt_cli_main_keys", "label": "references", "title": "references [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_keys", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_keys", "to": "keycrypt_cli_main_keys_init", "label": "method", "title": "method [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_keys", "to": "keycrypt_cli_main_keys_passphrase", "label": "method", "title": "method [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_keys", "to": "keycrypt_cli_main_keys_get", "label": "method", "title": "method [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_rationale_128", "to": "keycrypt_cli_main_keys", "label": "rationale_for", "title": "rationale_for [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_decrypt", "to": "keycrypt_cli_main_inputs", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_decrypt", "to": "keycrypt_cli_main_unseal", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_decrypt", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_decrypt", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_cmd_encrypt", "to": "keycrypt_cli_main_inputs", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_encrypt", "to": "keycrypt_cli_main_load_keyring", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_encrypt", "to": "keycrypt_cli_main_ask_pass", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_encrypt", "to": "keycrypt_cli_main_pbkdf2_key", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_encrypt", "to": "keycrypt_cli_main_scrypt_key", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_encrypt", "to": "keycrypt_cli_main_seal", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_encrypt", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_encrypt", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_inputs", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_keys_get", "to": "keycrypt_cli_main_keys_passphrase", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_keys_get", "to": "keycrypt_cli_main_pbkdf2_key", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_keys_get", "to": "keycrypt_cli_main_scrypt_key", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_unseal", "to": "keycrypt_cli_main_keys_get", "label": "calls", "title": "calls [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_keys_init", "to": "keycrypt_cli_main_load_keyring", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_keys_passphrase", "to": "keycrypt_cli_main_ask_pass", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_pbkdf2_key", "to": "hashlib", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_pbkdf2_key", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_importkey", "to": "keycrypt_cli_main_scrypt_key", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_setkey", "to": "keycrypt_cli_main_scrypt_key", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_scrypt_key", "to": "hashlib", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_scrypt_key", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_seal", "to": "os", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_seal", "to": "base64", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_seal", "to": "keycrypt_cli_main_subkeys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_seal", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_unseal", "to": "keycrypt_cli_main_subkeys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_subkeys", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_unseal", "to": "base64", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_unseal", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_cipher", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_cipher", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_cipher", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_cmd_clearkey", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_clearkey", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_clearkey", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_cmd_layout", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_layout", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_layout", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_cmd_mode", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_mode", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_mode", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_cmd_os", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_os", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_os", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_cmd_remap", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_remap", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_remap", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_cmd_status", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_status", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_status", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_cmd_usbdump", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_usbdump", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_usbdump", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_main", "to": "argparse", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_main", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_setkey", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_readkey", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_importkey", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_main", "to": "keycrypt_cli_main_cmd_flash", "label": "indirect_call", "title": "indirect_call [INFERRED]", "dashes": true, "width": 1, "color": {"opacity": 0.35}, "confidence": "INFERRED"}, {"from": "keycrypt_cli_main_cmd_readkey", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_setkey", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_send_key", "to": "keycrypt_cli_main_talk", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_talk", "to": "keycrypt_cli_main_find_port", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_talk", "to": "time", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_talk", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_rationale_219", "to": "keycrypt_cli_main_talk", "label": "rationale_for", "title": "rationale_for [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_flash", "to": "keycrypt_cli_main_find_bootdrive", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_flash", "to": "keycrypt_cli_main_find_port", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_flash", "to": "sys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_flash", "to": "time", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_flash", "to": "shutil", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_flash", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_find_bootdrive", "to": "glob", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_find_bootdrive", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_find_port", "to": "glob", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_find_port", "to": "sys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_find_port", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_readkey", "to": "sys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_readkey", "to": "keycrypt_cli_main_remember", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_readkey", "to": "keycrypt_cli_main_export_string", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_readkey", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_setkey", "to": "keycrypt_cli_main_ask_pass", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_setkey", "to": "keycrypt_cli_main_load_keyring", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_setkey", "to": "keycrypt_cli_main_save_keyring", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_setkey", "to": "os", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_setkey", "to": "keycrypt_cli_main_send_key", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_setkey", "to": "keycrypt_cli_main_remember", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_setkey", "to": "keycrypt_cli_main_export_string", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_setkey", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_export_string", "to": "hashlib", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_export_string", "to": "base64", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_export_string", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_remember", "to": "keycrypt_cli_main_load_keyring", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_load_keyring", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_importkey", "to": "keycrypt_cli_main_remember", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_remember", "to": "keycrypt_cli_main_save_keyring", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_remember", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_save_keyring", "to": "os", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_save_keyring", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_ask_pass", "to": "getpass", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_ask_pass", "to": "sys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_importkey", "to": "keycrypt_cli_main_ask_pass", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_ask_pass", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_importkey", "to": "keycrypt_cli_main_parse_export", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_importkey", "to": "keycrypt_cli_main_send_key", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_cmd_importkey", "to": "sys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_cmd_importkey", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_parse_export", "to": "sys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_parse_export", "to": "base64", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_parse_export", "to": "hashlib", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_parse_export", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_send_key", "to": "sys", "label": "calls", "title": "calls [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "keycrypt_cli_main_send_key", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "time", "label": "imports", "title": "imports [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "argparse", "label": "imports", "title": "imports [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "base64", "label": "imports", "title": "imports [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "getpass", "label": "imports", "title": "imports [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "glob", "label": "imports", "title": "imports [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "hashlib", "label": "imports", "title": "imports [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "os", "label": "imports", "title": "imports [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "shutil", "label": "imports", "title": "imports [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "sys", "label": "imports", "title": "imports [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main", "to": "importlib", "label": "imports_from", "title": "imports_from [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme", "to": "keycrypt_cli_main", "label": "references", "title": "references [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "keycrypt_cli_main_rationale_1", "to": "keycrypt_cli_main", "label": "rationale_for", "title": "rationale_for [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme", "to": "readme_pico_desktop_encryptor_keycrypt", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_1_what_you_need", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_3_install_the_keycrypt_command", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_4_flash_the_pico", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_build_from_source", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_ciphertext_format", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_license", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_limits_read_these", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_open_source", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_5_set_your_key", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_6_use_it", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_pico_desktop_encryptor_keycrypt", "to": "readme_2_wiring", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_5_set_your_key", "to": "readme_reading_the_key_back", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_5_set_your_key", "to": "readme_stronger_encryption", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_5_set_your_key", "to": "readme_tell_it_your_computer_s_layout_and_os", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_5_set_your_key", "to": "readme_windows_keyboard_on_a_mac", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_6_use_it", "to": "readme_caps_lock_bypass", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_6_use_it", "to": "readme_decrypting_on_the_computer", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_6_use_it", "to": "readme_all_commands", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_2_wiring", "to": "readme_keyboard_socket_usb_a_female", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "readme_2_wiring", "to": "readme_mode_switch", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}, {"from": "scripts_build_firmware", "to": "scripts_build_firmware_sh__entry", "label": "contains", "title": "contains [EXTRACTED]", "dashes": false, "width": 2, "color": {"opacity": 0.7}, "confidence": "EXTRACTED"}];
+const LEGEND = [{"cid": 0, "color": "#4E79A7", "label": "cmd_encrypt", "count": 15}, {"cid": 1, "color": "#F28E2B", "label": "main", "count": 11}, {"cid": 2, "color": "#E15759", "label": "main.py", "count": 10}, {"cid": 3, "color": "#76B7B2", "label": "pico-desktop-encryptor (KeyCrypt)", "count": 10}, {"cid": 4, "color": "#59A14F", "label": "cmd_setkey", "count": 7}, {"cid": 5, "color": "#EDC948", "label": "cmd_importkey", "count": 6}, {"cid": 6, "color": "#B07AA1", "label": "5. Set your key", "count": 5}, {"cid": 7, "color": "#FF9DA7", "label": "6. Use it", "count": 4}, {"cid": 8, "color": "#9C755F", "label": "2. Wiring", "count": 3}, {"cid": 9, "color": "#BAB0AC", "label": "build-firmware.sh", "count": 2}, {"cid": 10, "color": "#4E79A7", "label": "__init__.py", "count": 1}, {"cid": 11, "color": "#F28E2B", "label": "pico-desktop-encryptor", "count": 1}];
+
+// HTML-escape helper — prevents XSS when injecting graph data into innerHTML
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// Build vis datasets
+const nodesDS = new vis.DataSet(RAW_NODES.map((n, i) => ({
+  id: n.id, label: n.label, color: n.color, size: n.size,
+  font: n.font, title: n.title,
+  // Fermat/golden-angle spiral seed positions (#3699): spreading nodes out
+  // before physics runs keeps avoidOverlap from computing near-zero-distance
+  // repulsion that blows the BarnesHut recursion into a stack overflow on large
+  // graphs. `i` is the map index — physics still settles small graphs identically.
+  x: 30 * Math.sqrt(i) * Math.cos(i * 2.4),
+  y: 30 * Math.sqrt(i) * Math.sin(i * 2.4),
+  community: n.community, community_name: n.community_name,
+  source_file: n.source_file, file_type: n.file_type, degree: n.degree,
+  member_count: n.member_count,
+})));
+
+const edgesDS = new vis.DataSet(RAW_EDGES.map((e, i) => ({
+  id: i, from: e.from, to: e.to,
+  label: '',
+  title: e.title,
+  dashes: e.dashes,
+  width: e.width,
+  color: e.color,
+  arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+})));
+
+const container = document.getElementById('graph');
+const network = new vis.Network(container, { nodes: nodesDS, edges: edgesDS }, {
+  physics: {
+    enabled: true,
+    solver: 'forceAtlas2Based',
+    forceAtlas2Based: {
+      gravitationalConstant: -60,
+      centralGravity: 0.005,
+      springLength: 120,
+      springConstant: 0.08,
+      damping: 0.4,
+      avoidOverlap: 0.8,
+    },
+    stabilization: { iterations: 200, fit: true },
+  },
+  interaction: {
+    hover: true,
+    tooltipDelay: 100,
+    hideEdgesOnDrag: true,
+    navigationButtons: false,
+    keyboard: false,
+  },
+  nodes: { shape: 'dot', borderWidth: 1.5 },
+  edges: { smooth: { type: 'continuous', roundness: 0.2 }, selectionWidth: 3 },
+});
+
+// Theme toggle (#3894): Light / Dark / System, persisted in localStorage.
+const THEME_KEY = 'graphify-theme';
+const themeMQ = window.matchMedia ? window.matchMedia('(prefers-color-scheme: light)') : null;
+let themeLabelColor = '#ffffff';  // matches the per-node font color set in Python
+function themePref() {
+  let p = null;
+  try { p = localStorage.getItem(THEME_KEY); } catch (e) {}
+  return (p === 'light' || p === 'dark' || p === 'system') ? p : null;
+}
+function applyTheme(pref) {
+  const t = pref === 'light' ? 'light' : (pref === 'system' && themeMQ && themeMQ.matches) ? 'light' : 'dark';
+  const root = document.documentElement;
+  if (!root) return;
+  root.setAttribute('data-theme', t);
+  document.querySelectorAll('[data-theme-choice]').forEach(b => {
+    b.setAttribute('aria-pressed', String(b.dataset.themeChoice === (pref || 'dark')));
+  });
+  const labelColor = getComputedStyle(root).getPropertyValue('--node-label').trim();
+  if (labelColor && labelColor !== themeLabelColor) {
+    themeLabelColor = labelColor;
+    nodesDS.update(nodesDS.get().map(n => ({ id: n.id, font: Object.assign({}, n.font, { color: labelColor }) })));
+  }
+}
+document.querySelectorAll('[data-theme-choice]').forEach(b => {
+  b.addEventListener('click', () => {
+    const pref = b.dataset.themeChoice;
+    try { localStorage.setItem(THEME_KEY, pref); } catch (e) {}
+    applyTheme(pref);
+  });
+});
+if (themeMQ) {
+  const onSchemeChange = () => { if (themePref() === 'system') applyTheme('system'); };
+  if (themeMQ.addEventListener) themeMQ.addEventListener('change', onSchemeChange);
+  else if (themeMQ.addListener) themeMQ.addListener(onSchemeChange);
+}
+applyTheme(themePref());
+
+network.once('stabilizationIterationsDone', () => {
+  network.setOptions({ physics: { enabled: false } });
+});
+
+function showInfo(nodeId) {
+  const n = nodesDS.get(nodeId);
+  if (!n) return;
+  const neighborIds = network.getConnectedNodes(nodeId);
+  const neighborItems = neighborIds.map(nid => {
+    const nb = nodesDS.get(nid);
+    const color = nb ? nb.color.background : '#555';
+    return `<span class="neighbor-link" style="border-left-color:${esc(color)}" data-nid="${esc(nid)}">${esc(nb ? nb.label : nid)}</span>`;
+  }).join('');
+  const isMetaNode = !n.file_type && !n.source_file;
+  let html = `<div class="field"><b>${esc(n.label)}</b></div>`;
+  if (!isMetaNode) {
+    html += `<div class="field">Type: ${esc(n.file_type || 'unknown')}</div>`;
+  }
+  html += `<div class="field">Community: ${esc(n.community_name || '')}</div>`;
+  if (!isMetaNode) {
+    html += `<div class="field">Source: ${esc(n.source_file || '-')}</div>`;
+  } else if (n.member_count !== undefined && n.member_count !== null) {
+    html += `<div class="field">Members: ${esc(n.member_count)}</div>`;
+  }
+  html += `<div class="field">Degree: ${n.degree}</div>`;
+  if (neighborIds.length) {
+    html += `<div class="field" style="margin-top:8px;color:var(--text-2);font-size:11px">Neighbors (${neighborIds.length})</div><div id="neighbors-list">${neighborItems}</div>`;
+  }
+  document.getElementById('info-content').innerHTML = html;
+}
+
+function focusNode(nodeId) {
+  network.focus(nodeId, { scale: 1.4, animation: true });
+  network.selectNodes([nodeId]);
+  showInfo(nodeId);
+}
+
+// Neighbor links use a data attribute + one delegated listener rather than an
+// inline onclick. A node id/label sourced from a document or a scraped URL
+// (graphify add) can contain a double-quote; dropping the stringified id
+// unescaped into a quoted onclick both broke every link and allowed a hostile
+// source to inject an event handler into the local report (stored XSS, #1838).
+// esc() on data-nid keeps the value inside the attribute; the listener reads it
+// back verbatim. Bound to document so it survives the innerHTML rebuild that
+// recreates #neighbors-list on each showInfo().
+document.addEventListener('click', e => {
+  const el = e.target.closest('.neighbor-link');
+  if (el && el.dataset.nid !== undefined) focusNode(el.dataset.nid);
+});
+
+// Sidebar tooltips reuse vis-network's .vis-tooltip style and 100ms tooltipDelay.
+// Names get one only when CSS ellipsis truncates them (the full text is still in
+// the DOM); counts always get one, to say what the number is. Text is set with
+// textContent only (labels are untrusted). Delegated on document so rows rebuilt
+// later (search results, showInfo()) are covered.
+const sidebarTip = document.createElement('div');
+sidebarTip.className = 'vis-tooltip';
+sidebarTip.style.cssText = 'white-space: normal; max-width: 360px; overflow-wrap: break-word;';
+document.body.appendChild(sidebarTip);
+let sidebarTipTimer = null;
+let sidebarTipEl = null;    // element whose text the tooltip shows
+let sidebarTipZone = null;  // element the pointer must leave to hide it
+function hideSidebarTip() {
+  clearTimeout(sidebarTipTimer);
+  sidebarTip.style.visibility = 'hidden';
+  sidebarTip.textContent = '';
+  sidebarTipEl = sidebarTipZone = null;
+}
+document.addEventListener('mouseover', e => {
+  const zone = e.target.closest && e.target.closest('.legend-count, .legend-item, .search-item, .neighbor-link');
+  // Anywhere on a legend row except its count (dot, checkbox, gaps, padding)
+  // stands for the row's name, so moving within the row never re-triggers it.
+  const el = zone && zone.classList.contains('legend-item') ? zone.querySelector('.legend-label') : zone;
+  if (!el || el === sidebarTipEl) return;
+  hideSidebarTip();
+  const isCount = el.classList.contains('legend-count');
+  if (!isCount && el.scrollWidth <= el.clientWidth) return;
+  const text = isCount ? `${el.textContent} ${el.textContent === '1' ? 'node' : 'nodes'}` : el.textContent;
+  sidebarTipEl = el;
+  sidebarTipZone = zone;
+  const x = e.clientX, y = e.clientY;
+  sidebarTipTimer = setTimeout(() => {
+    sidebarTip.textContent = text;
+    sidebarTip.style.left = sidebarTip.style.top = '0px';  // measure at full max-width
+    sidebarTip.style.visibility = 'visible';
+    const w = sidebarTip.offsetWidth, h = sidebarTip.offsetHeight;
+    sidebarTip.style.left = Math.max(4, Math.min(x + 12, window.innerWidth - w - 4)) + 'px';
+    sidebarTip.style.top = (y + 16 + h > window.innerHeight ? Math.max(4, y - h - 8) : y + 16) + 'px';
+  }, 100);
+});
+document.addEventListener('mouseout', e => {
+  if (sidebarTipZone && !sidebarTipZone.contains(e.relatedTarget)) hideSidebarTip();
+});
+// A click rebuilds or hides the row (showInfo(), search pick) without a mouseout.
+document.addEventListener('mousedown', hideSidebarTip);
+
+// Track hovered node — hover detection is more reliable than click params
+let hoveredNodeId = null;
+network.on('hoverNode', params => {
+  hoveredNodeId = params.node;
+  container.style.cursor = 'pointer';
+});
+network.on('blurNode', () => {
+  hoveredNodeId = null;
+  container.style.cursor = 'default';
+});
+container.addEventListener('click', () => {
+  if (hoveredNodeId !== null) {
+    showInfo(hoveredNodeId);
+    network.selectNodes([hoveredNodeId]);
+  }
+});
+network.on('click', params => {
+  if (params.nodes.length > 0) {
+    showInfo(params.nodes[0]);
+  } else if (hoveredNodeId === null) {
+    document.getElementById('info-content').innerHTML = '<span class="empty">Click a node to inspect it</span>';
+  }
+});
+
+const searchInput = document.getElementById('search');
+const searchResults = document.getElementById('search-results');
+searchInput.addEventListener('input', () => {
+  const q = searchInput.value.toLowerCase().trim();
+  searchResults.innerHTML = '';
+  if (!q) { searchResults.style.display = 'none'; return; }
+  const matches = RAW_NODES.filter(n => n.label.toLowerCase().includes(q)).slice(0, 20);
+  if (!matches.length) { searchResults.style.display = 'none'; return; }
+  searchResults.style.display = 'block';
+  matches.forEach(n => {
+    const el = document.createElement('div');
+    el.className = 'search-item';
+    el.textContent = n.label;
+    el.style.borderLeft = `3px solid ${n.color.background}`;
+    el.style.paddingLeft = '8px';
+    el.onclick = () => {
+      network.focus(n.id, { scale: 1.5, animation: true });
+      network.selectNodes([n.id]);
+      showInfo(n.id);
+      searchResults.style.display = 'none';
+      searchInput.value = '';
+    };
+    searchResults.appendChild(el);
+  });
+});
+document.addEventListener('click', e => {
+  if (!searchResults.contains(e.target) && e.target !== searchInput)
+    searchResults.style.display = 'none';
+});
+
+const hiddenCommunities = new Set();
+
+const selectAllCb = document.getElementById('select-all-cb');
+
+function updateSelectAllState() {
+  const total = LEGEND.length;
+  const hidden = hiddenCommunities.size;
+  selectAllCb.checked = hidden === 0;
+  selectAllCb.indeterminate = hidden > 0 && hidden < total;
+}
+
+function toggleAllCommunities(hide) {
+  document.querySelectorAll('.legend-item').forEach(item => {
+    hide ? item.classList.add('dimmed') : item.classList.remove('dimmed');
+  });
+  document.querySelectorAll('.legend-cb').forEach(cb => {
+    cb.checked = !hide;
+  });
+  LEGEND.forEach(c => {
+    if (hide) hiddenCommunities.add(c.cid); else hiddenCommunities.delete(c.cid);
+  });
+  const updates = RAW_NODES.map(n => ({ id: n.id, hidden: hide }));
+  nodesDS.update(updates);
+  updateSelectAllState();
+}
+
+const legendEl = document.getElementById('legend');
+LEGEND.forEach(c => {
+  const item = document.createElement('div');
+  item.className = 'legend-item';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.className = 'legend-cb';
+  cb.checked = true;
+  cb.addEventListener('change', (e) => {
+    e.stopPropagation();
+    if (cb.checked) {
+      hiddenCommunities.delete(c.cid);
+      item.classList.remove('dimmed');
+    } else {
+      hiddenCommunities.add(c.cid);
+      item.classList.add('dimmed');
+    }
+    const updates = RAW_NODES
+      .filter(n => n.community === c.cid)
+      .map(n => ({ id: n.id, hidden: !cb.checked }));
+    nodesDS.update(updates);
+    updateSelectAllState();
+  });
+  item.innerHTML = `<div class="legend-dot" style="background:${c.color}"></div>
+    <span class="legend-label">${c.label}</span>
+    <span class="legend-count">${c.count}</span>`;
+  item.prepend(cb);
+  item.onclick = (e) => {
+    if (e.target === cb) return;
+    cb.checked = !cb.checked;
+    cb.dispatchEvent(new Event('change'));
+  };
+  legendEl.appendChild(item);
+});
+</script>
+<script>
+// Render hyperedges as shaded regions
+const hyperedges = [];
+// afterDrawing passes ctx already transformed to network coordinate space.
+// Draw node positions raw — no manual pan/zoom/DPR math needed.
+
+// Andrew's monotone chain. Returns the hull in counter-clockwise order, which
+// is what the perimeter must be traced in. Collinear and duplicate points
+// collapse to the extremes, so degenerate member sets render as a segment
+// rather than a zero-area crossed path.
+function convexHull(pts) {
+    const p = pts.slice().sort((a, b) => (a.x - b.x) || (a.y - b.y));
+    if (p.length < 3) return p;
+    const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    const build = seq => {
+        const out = [];
+        for (const q of seq) {
+            while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], q) <= 0) out.pop();
+            out.push(q);
+        }
+        out.pop();
+        return out;
+    };
+    const hull = build(p).concat(build(p.slice().reverse()));
+    return hull.length >= 3 ? hull : p;
+}
+network.on('afterDrawing', function(ctx) {
+    hyperedges.forEach(h => {
+        // Legend toggles only set `hidden` on nodes; getPositions() still
+        // returns them, so skip hidden members or their hull lingers.
+        const positions = h.nodes
+            .filter(nid => { const n = nodesDS.get(nid); return n && n.hidden !== true; })
+            .map(nid => network.getPositions([nid])[nid])
+            .filter(p => p !== undefined);
+        if (positions.length < 2) return;
+        ctx.save();
+        ctx.globalAlpha = 0.12;
+        ctx.fillStyle = '#6366f1';
+        ctx.strokeStyle = '#6366f1';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        // Centroid and expanded hull in network coordinates.
+        // The perimeter must follow hull order, not h.nodes order: tracing the
+        // raw member order self-intersects whenever the layout does not happen
+        // to place members in angular order, filling as crossed wedges.
+        const cx = positions.reduce((s, p) => s + p.x, 0) / positions.length;
+        const cy = positions.reduce((s, p) => s + p.y, 0) / positions.length;
+        const hull = convexHull(positions);
+        const expanded = hull.map(p => ({
+            x: cx + (p.x - cx) * 1.15,
+            y: cy + (p.y - cy) * 1.15
+        }));
+        ctx.moveTo(expanded[0].x, expanded[0].y);
+        expanded.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 0.4;
+        ctx.stroke();
+        // Label
+        ctx.globalAlpha = 0.8;
+        ctx.fillStyle = '#4f46e5';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(h.label, cx, cy - 5);
+        ctx.restore();
+    });
+});
+</script>
+</body>
+</html>

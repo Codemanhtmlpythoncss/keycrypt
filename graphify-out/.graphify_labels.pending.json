@@ -1,0 +1,14 @@
+{
+  "0": "cmd_encrypt",
+  "1": "main",
+  "2": "main.py",
+  "3": "pico-desktop-encryptor (KeyCrypt)",
+  "4": "cmd_setkey",
+  "5": "cmd_importkey",
+  "6": "5. Set your key",
+  "7": "6. Use it",
+  "8": "2. Wiring",
+  "9": "build-firmware.sh",
+  "10": "__init__.py",
+  "11": "pico-desktop-encryptor"
+}
