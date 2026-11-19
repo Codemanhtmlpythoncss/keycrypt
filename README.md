@@ -116,17 +116,51 @@ The Pico restarts as KeyCrypt. On a Mac, a "Keyboard Setup Assistant" window may
 
 To update later, run `keycrypt flash` again. BOOTSEL isn't needed after the first time.
 
-## 5. Set your passphrase
+## 5. Set your key
 
+Pick **one** of these. All keys are made on your computer with scrypt (memory-hard), and only the
+finished 256-bit key goes to the Pico's flash, so it survives unplugging.
+
+**Strongest: a random key** (no passphrase to guess, so no dictionary attack is possible):
+```bash
+keycrypt setkey --random
+```
+It prints a key string like `KC2-ABCDE-FGHIJ-…`. Whoever decrypts your messages imports it once:
+```bash
+keycrypt importkey KC2-ABCDE-FGHIJ-...
+```
+Anyone with that string can read your messages, so hand it over in person, not over chat.
+
+**Default: passphrase + secret code:**
 ```bash
 keycrypt setkey
 ```
-Type the passphrase twice. The key is made on your computer with **scrypt** (memory-hard,
-so guessing passphrases is slow even on GPUs) with a random salt, then stored in the Pico's flash,
-so it survives unplugging. You need the **same passphrase** to decrypt.
+Type a passphrase twice. KeyCrypt also makes a random 128-bit **secret code** and mixes it into the
+passphrase before scrypt. The way your key is encoded is then unique to you: without the code, a
+dictionary attack on your passphrase gets nowhere, even though this code is open source. Without the
+passphrase, the code alone is useless too. The code is saved on this computer (the passphrase never
+is) and printed as `KC2-…` for the other person to `keycrypt importkey`. They also need the passphrase.
 
-`keycrypt setkey --kdf pbkdf2` uses the old method instead (PBKDF2, worked out on the Pico, fixed salt).
-Use it only if you need the Pico to decrypt text made before v1.6. The `keycrypt decrypt` command reads both.
+**Passphrase only:** `keycrypt setkey --plain`. **Old style** (PBKDF2 on the Pico, pre-1.6): `keycrypt setkey --pbkdf2`.
+
+### Reading the key back
+
+```bash
+keycrypt readkey
+```
+The Pico only hands over its key after you **press the BOOTSEL button on the Pico** within 15 seconds
+(the LED blinks fast while it waits). Malware on the computer can't press a button, so it can't steal
+the key. It prints the key as a `KC2-…` string and saves it on this computer.
+
+To put a key you were given onto a Pico: `keycrypt importkey KC2-... --to-device`.
+
+Saved keys and codes live in `~/.config/keycrypt/keyring.json` (readable only by you).
+`keycrypt decrypt` picks the right one from the ciphertext automatically and only asks for a passphrase when it needs one.
+
+```bash
+keycrypt status
+```
+This prints the mode, the cipher, and the key type.
 
 ### Stronger encryption
 
@@ -231,7 +265,10 @@ keycrypt encrypt "some secret"
 | Command | What it does |
 |---|---|
 | `keycrypt flash` | install or update the firmware |
-| `keycrypt setkey [--kdf scrypt\|pbkdf2]` | set the passphrase on the device (scrypt by default) |
+| `keycrypt setkey [--random\|--plain\|--pbkdf2]` | set the key (default: passphrase + secret code) |
+| `keycrypt readkey` | show the Pico's key as `KC2-…` (press BOOTSEL to allow) |
+| `keycrypt importkey KC2-… [--to-device]` | save a key or secret code you were given |
+| `keycrypt usbdump` | debug: what the keyboard's media keys / knob send |
 | `keycrypt cipher aes\|chacha\|cascade` | which encryption the device uses |
 | `keycrypt status` | show mode, key, keyboard state, and what the USB port sees |
 | `keycrypt mode encrypt\|decrypt\|stealth\|off\|switch` | set the mode from the computer (`switch` = follow the switch again) |
@@ -239,7 +276,7 @@ keycrypt encrypt "some secret"
 | `keycrypt os mac\|windows\|linux` | your computer's OS |
 | `keycrypt remap win-mac\|win-mac-ctrl\|off` | Windows keyboard on a Mac (see above) |
 | `keycrypt clearkey` | wipe the key from the device |
-| `keycrypt encrypt [--cipher …] [--kdf …] TEXT` | encrypt on this computer |
+| `keycrypt encrypt [--cipher …] TEXT` | encrypt on this computer with your current key |
 | `keycrypt decrypt TEXT` | decrypt on this computer (or from stdin) |
 
 Set `KEYCRYPT_PASSPHRASE` in the environment to skip the passphrase prompt (for scripts).
@@ -254,18 +291,21 @@ Set `KEYCRYPT_PASSPHRASE` in the environment to skip the passphrase prompt (for 
   For pasted ciphertext, use `keycrypt decrypt`.
 - Only `us` and `uk` computer layouts are supported for now (see `keycrypt layout`).
 - Max 512 characters per line.
-- Only the main keyboard interface is passed through. Media keys and volume knobs on fancy keyboards won't work.
+- Media keys and volume knobs (consumer-control keys) are passed through in every mode. Other extras
+  (power/sleep keys, built-in mouse functions, vendor lighting software) are not. If your media keys
+  don't work, press them and run `keycrypt usbdump` to see what the keyboard sends.
 
 ## Ciphertext format
 
-**v2** (anything except `aes` with a PBKDF2 key): `k2.` + `base64( cipher[1] ‖ kdf[1] ‖ salt[16, scrypt only] ‖ body )`
+**v2** (anything except `aes` with a PBKDF2 key): `k2.` + `base64( cipher[1] ‖ kdf[1] ‖ key id[16, not for PBKDF2] ‖ body )`
 
 - `aes`: `nonce[12] ‖ AES-256-GCM(Ka) ‖ tag[16]`
 - `chacha`: `nonce[12] ‖ ChaCha20-Poly1305(Kc) ‖ tag[16]`
 - `cascade`: ChaCha20-Poly1305(Kc) wrapped around the whole `aes` body
 
 The header is authenticated (AAD). `Ka = HMAC-SHA256(key, "keycrypt aes")`, `Kc = HMAC-SHA256(key, "keycrypt chacha")`.
-Key: scrypt(passphrase, salt, N=2^17, r=8, p=1, 32 bytes) or PBKDF2 (below).
+kdf: 1 = scrypt(passphrase, id), 2 = random key, 3 = scrypt(HMAC-SHA256(secret code, passphrase), id); scrypt N=2^17, r=8, p=1.
+Key strings: `KC2-` + base32( type `K`/`C` ‖ kdf ‖ id[16] ‖ key[32] or code[16] ‖ SHA-256 checksum[2] ).
 
 **Legacy** (`aes` + PBKDF2 key, and everything before v1.6): `base64( nonce[12] ‖ AES-256-GCM ciphertext ‖ tag[16] )`,
 key = `PBKDF2-HMAC-SHA256(passphrase, salt="keycrypt-v1", 50000 iterations, 32 bytes)`.

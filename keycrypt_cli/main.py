@@ -15,17 +15,22 @@ SALT, ITERS = b"keycrypt-v1", 50000
 
 # ---------------------------------------------------------------- crypto
 # legacy: base64(nonce|AES-GCM ct|tag), key = PBKDF2 with fixed salt
-# v2:     "k2." base64(cipher kdf [salt16] | body), see firmware for the layout
+# v2:     "k2." base64(cipher kdf [key id 16] | body), see firmware for the layout
+# kdf: 0 PBKDF2, 1 scrypt(passphrase), 2 random key, 3 scrypt(passphrase + secret code)
 CIPHERS = ["aes", "chacha", "cascade"]
+KDF_NAME = ["PBKDF2", "scrypt passphrase", "random key", "passphrase + secret code"]
 SCRYPT = dict(n=2 ** 17, r=8, p=1, maxmem=256 * 1024 * 1024, dklen=32)
+KEYRING = os.path.join(os.path.expanduser("~"), ".config", "keycrypt", "keyring.json")
 
 
 def pbkdf2_key(pw: str) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", pw.encode(), SALT, ITERS, 32)
 
 
-def scrypt_key(pw: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(pw.encode(), salt=salt, **SCRYPT)
+def scrypt_key(pw: str, salt: bytes, code: bytes = None) -> bytes:
+    import hmac
+    secret = hmac.new(code, pw.encode(), "sha256").digest() if code else pw.encode()
+    return hashlib.scrypt(secret, salt=salt, **SCRYPT)
 
 
 def subkeys(key: bytes):
@@ -51,12 +56,64 @@ def inputs(args_text):
     return [l.strip() for l in sys.stdin.read().splitlines() if l.strip()]
 
 
-def seal(pt: bytes, key: bytes, cipher: str, kdf: int, salt: bytes = b"") -> str:
+# ---------------------------------------------------------------- keyring + shareable key strings
+# Stored in ~/.config/keycrypt/keyring.json (only you can read it):
+#   keys:  key id -> [kdf, full key]        (from setkey --random, readkey, importkey)
+#   codes: key id -> secret code            (passphrase + secret code keys; passphrase is never stored)
+# Shareable string: KC2-<base32 of type | id | secret | checksum>, type K = full key, C = secret code
+def load_keyring():
+    try:
+        import json
+        with open(KEYRING) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"keys": {}, "codes": {}, "current": None}
+
+
+def save_keyring(kr):
+    import json
+    os.makedirs(os.path.dirname(KEYRING), exist_ok=True)
+    fd = os.open(KEYRING, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(kr, f, indent=1)
+    os.chmod(KEYRING, 0o600)
+
+
+def remember(kid: bytes, kdf: int = None, key: bytes = None, code: bytes = None):
+    kr = load_keyring()
+    if key is not None:
+        kr["keys"][kid.hex()] = [kdf, key.hex()]
+    if code is not None:
+        kr["codes"][kid.hex()] = code.hex()
+    kr["current"] = kid.hex()
+    save_keyring(kr)
+
+
+def export_string(kind: str, kdf: int, kid: bytes, secret: bytes) -> str:
+    raw = kind.encode() + bytes([kdf]) + kid + secret
+    raw += hashlib.sha256(raw).digest()[:2]
+    b = base64.b32encode(raw).decode().rstrip("=")
+    return "KC2-" + "-".join(b[i:i + 5] for i in range(0, len(b), 5))
+
+
+def parse_export(s: str):
+    b = s.strip().upper().replace(" ", "")
+    if not b.startswith("KC2-"):
+        sys.exit("not a KeyCrypt key string (should start with KC2-)")
+    b = b[4:].replace("-", "")
+    raw = base64.b32decode(b + "=" * (-len(b) % 8))
+    if hashlib.sha256(raw[:-2]).digest()[:2] != raw[-2:]:
+        sys.exit("key string has a typo (checksum wrong)")
+    return raw[:1].decode(), raw[1], raw[2:18], raw[18:-2]
+
+
+# ---------------------------------------------------------------- encrypt / decrypt
+def seal(pt: bytes, key: bytes, cipher: str, kdf: int, kid: bytes = b"") -> str:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
     if cipher == "aes" and kdf == 0:
         n = os.urandom(12)
         return base64.b64encode(n + AESGCM(key).encrypt(n, pt, None)).decode()
-    hdr = bytes([CIPHERS.index(cipher), kdf]) + (salt if kdf == 1 else b"")
+    hdr = bytes([CIPHERS.index(cipher), kdf]) + (kid if kdf else b"")
     ka, kc = subkeys(key)
     if cipher in ("aes", "cascade"):
         n = os.urandom(12)
@@ -67,25 +124,47 @@ def seal(pt: bytes, key: bytes, cipher: str, kdf: int, salt: bytes = b"") -> str
     return "k2." + base64.b64encode(hdr + pt).decode()
 
 
-def unseal(word: str, pw: str, cache: dict) -> str:
+class Keys:
+    """Finds the key for a ciphertext: keyring first, passphrase only when needed (asked once)."""
+    def __init__(self):
+        self.kr, self.pw, self.cache = load_keyring(), None, {}
+
+    def passphrase(self):
+        if self.pw is None:
+            self.pw = ask_pass()
+        return self.pw
+
+    def get(self, kdf: int, kid: bytes) -> bytes:
+        k = (kdf, kid)
+        if k in self.cache:
+            return self.cache[k]
+        saved = self.kr["keys"].get(kid.hex()) if kdf else None
+        if saved:
+            key = bytes.fromhex(saved[1])
+        elif kdf == 0:
+            key = pbkdf2_key(self.passphrase())
+        elif kdf == 1:
+            key = scrypt_key(self.passphrase(), kid)
+        elif kdf == 3 and kid.hex() in self.kr["codes"]:
+            key = scrypt_key(self.passphrase(), kid, bytes.fromhex(self.kr["codes"][kid.hex()]))
+        else:
+            raise LookupError("this key isn't on this computer: get its KC2- string and run keycrypt importkey")
+        self.cache[k] = key
+        return key
+
+
+def unseal(word: str, keys: Keys) -> str:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
-    if "pbkdf2" not in cache:
-        cache["pbkdf2"] = pbkdf2_key(pw)
     if not word.startswith("k2."):
         raw = base64.b64decode(word, validate=True)
-        return AESGCM(cache["pbkdf2"]).decrypt(raw[:12], raw[12:], None).decode()
+        return AESGCM(keys.get(0, b"")).decrypt(raw[:12], raw[12:], None).decode()
     raw = base64.b64decode(word[3:], validate=True)
     cipher, kdf = CIPHERS[raw[0]], raw[1]
-    if kdf == 1:
-        hdr, body = raw[:18], raw[18:]
-        if hdr[2:] not in cache:
-            cache[hdr[2:]] = scrypt_key(pw, hdr[2:])
-        key = cache[hdr[2:]]
-    elif kdf == 0:
-        hdr, body, key = raw[:2], raw[2:], cache["pbkdf2"]
-    else:
+    if kdf > 3:
         raise ValueError("unknown key type")
-    ka, kc = subkeys(key)
+    h = 18 if kdf else 2
+    hdr, body = raw[:h], raw[h:]
+    ka, kc = subkeys(keys.get(kdf, hdr[2:]))
     if cipher in ("chacha", "cascade"):
         body = ChaCha20Poly1305(kc).decrypt(body[:12], body[12:], hdr)
     if cipher in ("aes", "cascade"):
@@ -95,25 +174,33 @@ def unseal(word: str, pw: str, cache: dict) -> str:
 
 def cmd_decrypt(a):
     items = inputs(a.text)
-    pw, cache = ask_pass(), {}
+    keys = Keys()
     for ct in items:
         for word in ct.split():  # allow several ciphertexts on one line
             try:
-                print(unseal(word, pw, cache))
+                print(unseal(word, keys))
+            except LookupError as e:
+                print(f"[cannot decrypt: {e}]")
             except Exception:
                 print("[cannot decrypt: wrong key or damaged text]")
 
 
 def cmd_encrypt(a):
     items = inputs(a.text)
-    pw = ask_pass()
-    if a.kdf == "scrypt":
-        salt = os.urandom(16)
-        key, kdf = scrypt_key(pw, salt), 1
+    kr = load_keyring()
+    cur = kr.get("current")
+    if a.passphrase_only or not cur:
+        key, kdf, kid = pbkdf2_key(ask_pass()), 0, b""
     else:
-        salt, key, kdf = b"", pbkdf2_key(pw), 0
+        kid = bytes.fromhex(cur)
+        if cur in kr["keys"]:
+            kdf, key = kr["keys"][cur][0], bytes.fromhex(kr["keys"][cur][1])
+        elif cur in kr["codes"]:
+            kdf, key = 3, scrypt_key(ask_pass(), kid, bytes.fromhex(kr["codes"][cur]))
+        else:
+            kdf, key = 1, scrypt_key(ask_pass(), kid)
     for pt in items:
-        print(seal(pt.encode(), key, a.cipher, kdf, salt))
+        print(seal(pt.encode(), key, a.cipher, kdf, kid))
 
 
 # ---------------------------------------------------------------- device
@@ -128,25 +215,99 @@ def find_port():
     return ports[0]
 
 
-def talk(cmd, wait=1.0):
+def talk(cmd, wait=1.0, until=None):
+    """Send a command. With `until`, read lines until one starts with a marker (or `wait` seconds pass)."""
     import serial
     with serial.Serial(find_port(), 115200, timeout=0.5) as p:
         p.reset_input_buffer()
         p.write((cmd + "\r").encode())
-        time.sleep(wait)
-        return p.read(4096).decode(errors="replace").strip()
+        if not until:
+            time.sleep(wait)
+            return p.read(4096).decode(errors="replace").strip()
+        out, end = [], time.time() + wait
+        while time.time() < end:
+            line = p.readline().decode(errors="replace").strip()
+            if not line:
+                continue
+            out.append(line)
+            if line.startswith("press"):
+                print(line)
+            if line.startswith(until):
+                break
+        return "\n".join(out)
+
+
+def send_key(key: bytes, kid: bytes, kdf: int):
+    reply = talk(f"rawkey {key.hex()} {kid.hex()} {kdf}", 3, until=("key saved", "usage"))
+    if "key saved" not in reply:
+        sys.exit("device did not accept the key:\n" + reply)
+    print("key saved on the Pico")
 
 
 def cmd_setkey(a):
-    pw = ask_pass(confirm=True)
-    if a.kdf == "pbkdf2":
+    if a.pbkdf2:
+        pw = ask_pass(confirm=True)
         print("saving key on device (takes a few seconds)...")
         print(talk("key " + pw, 8))
+        kr = load_keyring(); kr["current"] = None; save_keyring(kr)
         return
-    print("making key with scrypt (strong, takes a second)...")
-    salt = os.urandom(16)
-    key = scrypt_key(pw, salt)
-    print(talk(f"rawkey {key.hex()} {salt.hex()}", 1.5))
+    kid = os.urandom(16)
+    if a.random:
+        key = os.urandom(32)
+        send_key(key, kid, 2)
+        remember(kid, 2, key=key)
+        print("\nYour random key (also saved on this computer):\n\n  " + export_string("K", 2, kid, key))
+        print("\nGive it to whoever decrypts your messages; they run:  keycrypt importkey <key>")
+        print("Anyone with this string can read your messages. Share it in person, not over chat.")
+        return
+    pw = ask_pass(confirm=True)
+    if a.plain:
+        print("making key with scrypt...")
+        send_key(scrypt_key(pw, kid), kid, 1)
+        remember(kid)  # current key = passphrase-only, nothing secret stored
+        return
+    code = os.urandom(16)
+    print("making key from passphrase + a new random secret code (scrypt)...")
+    send_key(scrypt_key(pw, kid, code), kid, 3)
+    remember(kid, code=code)
+    print("\nYour secret code (saved on this computer, the passphrase is not):\n\n  " + export_string("C", 3, kid, code))
+    print("\nTo decrypt elsewhere you need BOTH this code and the passphrase:  keycrypt importkey <code>")
+
+
+def cmd_readkey(a):
+    reply = talk("readkey", 17, until=("KEY ", "cancelled", "no key"))
+    line = next((l for l in reply.splitlines() if l.startswith("KEY ")), None)
+    if not line:
+        sys.exit(reply.splitlines()[-1] if reply else "no reply from device")
+    _, kdf, kid, key = line.split()
+    kdf, kid, key = int(kdf), bytes.fromhex(kid), bytes.fromhex(key)
+    if kdf == 0:
+        print("This key was made on the Pico with PBKDF2 (old style); your passphrase is the key.")
+        print("Make a new one with:  keycrypt setkey --random")
+        return
+    remember(kid, kdf, key=key)
+    print(f"key type: {KDF_NAME[kdf]}  (saved on this computer)\n\n  " + export_string("K", kdf, kid, key))
+    print("\nAnyone with this string can read your messages. Share it in person, not over chat.")
+
+
+def cmd_importkey(a):
+    kind, kdf, kid, secret = parse_export(" ".join(a.key))
+    if kind == "K":
+        remember(kid, kdf, key=secret)
+        print(f"key imported ({KDF_NAME[kdf]})")
+        if a.to_device:
+            send_key(secret, kid, kdf)
+    elif kind == "C":
+        remember(kid, code=secret)
+        print("secret code imported; you'll be asked for the passphrase when decrypting")
+        if a.to_device:
+            send_key(scrypt_key(ask_pass(), kid, secret), kid, 3)
+    else:
+        sys.exit("unknown key string type")
+
+
+def cmd_usbdump(a):
+    print(talk("usbdump"))
 
 
 def cmd_cipher(a):
@@ -216,10 +377,20 @@ def cmd_flash(a):
 def main():
     ap = argparse.ArgumentParser(prog="keycrypt", description="Control the KeyCrypt Pico keyboard.")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("setkey", help="set the passphrase on the device")
-    p.add_argument("--kdf", choices=["scrypt", "pbkdf2"], default="scrypt",
-                   help="scrypt (default, strong, made on this computer) or pbkdf2 (old, made on the Pico)")
+    p = sub.add_parser("setkey", help="set the key on the device (default: passphrase + random secret code)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--random", action="store_true", help="truly random 256-bit key, no passphrase (strongest)")
+    g.add_argument("--plain", action="store_true", help="passphrase only (scrypt), no secret code")
+    g.add_argument("--pbkdf2", action="store_true", help="old style: passphrase, PBKDF2 on the Pico")
     p.set_defaults(f=cmd_setkey)
+    sub.add_parser("readkey", help="show the device's key as a KC2- string (press BOOTSEL on the Pico to allow)"
+                   ).set_defaults(f=cmd_readkey)
+    p = sub.add_parser("importkey", help="save a KC2- key or secret code from someone on this computer")
+    p.add_argument("key", nargs="+")
+    p.add_argument("--to-device", action="store_true", help="also put the key on the connected Pico")
+    p.set_defaults(f=cmd_importkey)
+    sub.add_parser("usbdump", help="debug: what the keyboard's extra USB interfaces send (media keys, knob)"
+                   ).set_defaults(f=cmd_usbdump)
     p = sub.add_parser("cipher", help="encryption the device uses: aes, chacha, cascade (aes inside chacha)")
     p.add_argument("cipher", choices=CIPHERS)
     p.set_defaults(f=cmd_cipher)
@@ -241,10 +412,9 @@ def main():
     p = sub.add_parser("decrypt", help="decrypt text (args or stdin)")
     p.add_argument("text", nargs="*")
     p.set_defaults(f=cmd_decrypt)
-    p = sub.add_parser("encrypt", help="encrypt text on this computer (args or stdin)")
+    p = sub.add_parser("encrypt", help="encrypt text on this computer with your current saved key (args or stdin)")
     p.add_argument("--cipher", choices=CIPHERS, default="aes")
-    p.add_argument("--kdf", choices=["pbkdf2", "scrypt"], default="pbkdf2",
-                   help="scrypt output can only be decrypted with the CLI (new random salt)")
+    p.add_argument("--passphrase-only", action="store_true", help="use the old PBKDF2 passphrase key instead")
     p.add_argument("text", nargs="*")
     p.set_defaults(f=cmd_encrypt)
     p = sub.add_parser("flash", help="install the KeyCrypt firmware on a Pico")
