@@ -204,6 +204,8 @@ static void saveSettings() {
 // =====================================================================
 // crypto
 // =====================================================================
+static void pumpKeyboard();  // keeps keys flowing during long jobs (defined with the keyboard logic)
+
 static void pbkdf2_sha256(const char* pass, uint8_t out[32]) {
   br_hmac_key_context kc;
   br_hmac_key_init(&kc, &br_sha256_vtable, pass, strlen(pass));
@@ -220,6 +222,7 @@ static void pbkdf2_sha256(const char* pass, uint8_t out[32]) {
     br_hmac_update(&hc, u, 32);
     br_hmac_out(&hc, u);
     for (int j = 0; j < 32; j++) out[j] ^= u[j];
+    if ((i & 255) == 0) pumpKeyboard();  // otherwise a key released now looks held (auto-repeat)
   }
 }
 
@@ -552,6 +555,18 @@ static void checkAutoRepeat() {
   }
 }
 
+// handle everything the keyboard sent so far (normal loop, and during long jobs like key derivation)
+static void pumpKeyboard() {
+  KbReport r;
+  while (queue_try_remove(&reportQ, &r)) handleReport(r);
+  uint16_t usage;
+  while (queue_try_remove(&mediaQ, &usage)) {   // media keys pass straight through in every mode
+    for (int i = 0; i < 20 && !usb_media.ready(); i++) delay(1);
+    usb_media.sendReport16(1, usage);
+  }
+  checkAutoRepeat();
+}
+
 // LED: solid = encrypt, blink = decrypt, off = off
 static void updateLed() {
   Mode m = readMode();
@@ -586,7 +601,10 @@ static void runCommand(String c) {
   if (c.startsWith("key ")) {
     String p = c.substring(4);
     Serial.println("deriving key...");
-    pbkdf2_sha256(p.c_str(), cfg.key);
+    uint8_t k[32];
+    pbkdf2_sha256(p.c_str(), k);  // into a temp: keys typed meanwhile still use the old key
+    memcpy(cfg.key, k, 32);
+    memset(k, 0, 32);
     cfg.hasKey = 1;
     cfg.kdf = 0;
     saveSettings();
@@ -616,7 +634,7 @@ static void runCommand(String c) {
     bool pressed = false;
     while (millis() - t0 < 15000 && !(pressed = BOOTSEL)) {
       digitalWrite(STATUS_LED, (millis() / 100) % 2);
-      delay(100);
+      for (int t = 0; t < 20; t++) { pumpKeyboard(); delay(5); }
     }
     if (!pressed) { Serial.println("cancelled: BOOTSEL not pressed"); return; }
     Serial.printf("KEY %u ", cfg.kdf);
@@ -725,14 +743,7 @@ void setup() {
 }
 
 void loop() {
-  KbReport r;
-  while (queue_try_remove(&reportQ, &r)) handleReport(r);
-  uint16_t usage;
-  while (queue_try_remove(&mediaQ, &usage)) {   // media keys pass straight through in every mode
-    for (int i = 0; i < 20 && !usb_media.ready(); i++) delay(1);
-    usb_media.sendReport16(1, usage);
-  }
-  checkAutoRepeat();
+  pumpKeyboard();
   updateLed();
   pollSerial();
 }
