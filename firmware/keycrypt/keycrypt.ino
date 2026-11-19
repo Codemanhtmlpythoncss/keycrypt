@@ -6,8 +6,9 @@
 //   ENCRYPT: typed line is erased and re-typed as base64(nonce|AES-256-GCM ciphertext|tag)
 //   DECRYPT: typed line (base64) is erased and re-typed as plaintext (left alone if it fails)
 //   OFF:     plain keyboard
+//   STEALTH: nothing reaches the computer while typing; on Enter only the ciphertext is typed
 // Bypass: while Caps Lock is ON, Enter is sent normally (overrides CLI mode and switch).
-// Mode switch: GP14 to GND = encrypt, GP15 to GND = decrypt, neither (or both) = off.
+// Mode switch: GP14 to GND = encrypt, GP15 to GND = decrypt, both = stealth, neither = off.
 // `keycrypt mode ...` can override the switch (saved in flash); `keycrypt mode switch` hands control back.
 // Key is set over USB serial ("key <passphrase>") and saved in flash.
 //
@@ -30,8 +31,8 @@
 static const char PBKDF2_SALT[] = "keycrypt-v1";
 static const uint32_t MAGIC = 0x4B435932;  // "KCY2"
 
-enum Mode { MODE_OFF, MODE_ENCRYPT, MODE_DECRYPT };
-static const char* const MODE_NAME[] = { "OFF", "ENCRYPT", "DECRYPT" };
+enum Mode { MODE_OFF, MODE_ENCRYPT, MODE_DECRYPT, MODE_STEALTH };
+static const char* const MODE_NAME[] = { "OFF", "ENCRYPT", "DECRYPT", "STEALTH" };
 
 // ---------- USB objects ----------
 Adafruit_USBH_Host USBHost;
@@ -55,7 +56,7 @@ static volatile uint32_t dbgMounts = 0, dbgReports = 0;
 static char dbgProtos[24] = "";
 
 // ---------- settings (flash) ----------
-// modeOverride: 0 = follow switch, 1 = off, 2 = encrypt, 3 = decrypt (set from CLI)
+// modeOverride: 0 = follow switch, 1 = off, 2 = encrypt, 3 = decrypt, 4 = stealth (set from CLI)
 // layout: 0 = US, 1 = UK.  os: 0 = mac, 1 = windows, 2 = linux  (how the COMPUTER is set up)
 // remap (Windows keyboard on a Mac): 0 = none,
 //   1 = "win-mac":      Alt <-> Win swap (Alt = Command, Win = Option, Ctrl stays Control)
@@ -80,11 +81,12 @@ static uint32_t lastKeyAt = 0;
 // helpers
 // =====================================================================
 static Mode readMode() {
-  if (cfg.modeOverride >= 1 && cfg.modeOverride <= 3) return (Mode)(cfg.modeOverride - 1);
+  if (cfg.modeOverride >= 1 && cfg.modeOverride <= 4) return (Mode)(cfg.modeOverride - 1);
   bool enc = digitalRead(PIN_SW_ENC) == LOW;
   bool dec = digitalRead(PIN_SW_DEC) == LOW;
   if (enc && !dec) return MODE_ENCRYPT;
   if (dec && !enc) return MODE_DECRYPT;
+  if (enc && dec) return MODE_STEALTH;
   return MODE_OFF;
 }
 
@@ -168,7 +170,7 @@ static void typeChar(char c) {
 static void loadSettings() {
   EEPROM.get(0, cfg);
   if (cfg.magic != MAGIC) { memset(&cfg, 0, sizeof cfg); cfg.magic = MAGIC; }
-  if (cfg.modeOverride > 3) cfg.modeOverride = 0;
+  if (cfg.modeOverride > 4) cfg.modeOverride = 0;
   if (cfg.layout > 1) cfg.layout = 0;
   if (cfg.os > 2) cfg.os = 0;
   if (cfg.remap > 2) cfg.remap = 0;
@@ -280,14 +282,16 @@ static int decryptText(const char* b64, int n, char* out, int cap) {
 // keyboard logic (core0)
 // =====================================================================
 // erase the tracked line, type `text`, press Enter
-static void replaceLine(const char* text, size_t n) {
+static void typeLine(const char* text, size_t n, int backspaces) {
   uint8_t none[6] = { 0 };
   sendReport(0, none);
   delay(2);
-  for (int i = 0; i < lineLen; i++) tapKey(0, HID_KEY_BACKSPACE);
+  for (int i = 0; i < backspaces; i++) tapKey(0, HID_KEY_BACKSPACE);
   for (size_t i = 0; i < n; i++) typeChar(text[i]);
   tapKey(0, HID_KEY_ENTER);
 }
+
+static void replaceLine(const char* text, size_t n) { typeLine(text, n, lineLen); }
 
 // returns true if Enter was handled (and should not be forwarded)
 static bool onEnter() {
@@ -331,8 +335,68 @@ static uint8_t remapMods(uint8_t m) {
   return out;
 }
 
+// ---------- stealth mode ----------
+// Nothing typed reaches the computer until Enter; then only the ciphertext is typed.
+// Keys we keep (chars, Enter, and Backspace/Esc while the buffer has text) are "captured"
+// and stay hidden until released; everything else (arrows, shortcuts...) passes through.
+static uint8_t captured[6];
+static bool wasStealth = false;
+
+static bool isCaptured(uint8_t k) {
+  for (int i = 0; i < 6; i++) if (captured[i] == k) return true;
+  return false;
+}
+
+static void handleStealth(KbReport r) {
+  bool ctrlGui = r.mod & (KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTCTRL |
+                          KEYBOARD_MODIFIER_LEFTGUI | KEYBOARD_MODIFIER_RIGHTGUI);
+  // forget captured keys that were released
+  for (int i = 0; i < 6; i++) if (captured[i] && !hasKey(r, captured[i])) captured[i] = 0;
+
+  for (int i = 0; i < 6; i++) {
+    uint8_t k = r.keys[i];
+    if (!k || hasKey(prev, k)) continue;  // only new presses
+    bool take = false;
+    if ((k == HID_KEY_ENTER || k == HID_KEY_KEYPAD_ENTER) && !ctrlGui) {
+      take = true;
+      if (lineLen > 0) {
+        String out = encryptText(line, lineLen);
+        typeLine(out.c_str(), out.length(), 0);
+      } else {
+        tapKey(0, HID_KEY_ENTER);
+      }
+      lineLen = 0;
+    } else if (ctrlGui) {
+      take = false;                                   // shortcuts pass through
+    } else if (k == HID_KEY_BACKSPACE || k == HID_KEY_ESCAPE) {
+      take = lineLen > 0;                             // edit the hidden buffer
+      if (take) lineLen = k == HID_KEY_ESCAPE ? 0 : lineLen - 1;
+    } else {
+      char c = keyToChar(k, r.mod);
+      if (c) {
+        take = true;
+        if (lineLen < MAX_LINE) line[lineLen++] = c;  // full: extra chars dropped, never leaked
+      }
+    }
+    if (take)
+      for (int j = 0; j < 6; j++) if (!captured[j]) { captured[j] = k; break; }
+  }
+
+  KbReport fwd = r;
+  for (int i = 0; i < 6; i++) if (fwd.keys[i] && isCaptured(fwd.keys[i])) fwd.keys[i] = 0;
+  sendReport(fwd.mod, fwd.keys);
+  prev = r;
+}
+
 static void handleReport(KbReport r) {
   r.mod = remapMods(r.mod);
+  bool stealth = readMode() == MODE_STEALTH && cfg.hasKey && !(ledState & KEYBOARD_LED_CAPSLOCK);
+  if (stealth != wasStealth) {   // entering/leaving stealth: pending hidden text is discarded
+    wasStealth = stealth;
+    resetLine();
+    memset(captured, 0, sizeof captured);
+  }
+  if (stealth) { handleStealth(r); return; }
   bool ctrlAltGui = r.mod & ~(KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
   bool ctrlGui = r.mod & (KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTCTRL |
                           KEYBOARD_MODIFIER_LEFTGUI | KEYBOARD_MODIFIER_RIGHTGUI);
@@ -376,6 +440,7 @@ static void handleReport(KbReport r) {
 }
 
 static void checkAutoRepeat() {
+  if (wasStealth) return;  // nothing is forwarded in stealth, so no OS auto-repeat
   if (lastKey && hasKey(prev, lastKey) && millis() - lastKeyAt > REPEAT_MS) {
     tracking = false;
     lastKey = 0;
@@ -385,7 +450,8 @@ static void checkAutoRepeat() {
 // LED: solid = encrypt, blink = decrypt, off = off
 static void updateLed() {
   Mode m = readMode();
-  bool on = m == MODE_ENCRYPT || (m == MODE_DECRYPT && (millis() / 250) % 2);
+  bool on = m == MODE_ENCRYPT || (m == MODE_DECRYPT && (millis() / 250) % 2) ||
+            (m == MODE_STEALTH && (lineLen == 0 || (millis() / 80) % 2));  // stealth: flicker = text waiting
   digitalWrite(STATUS_LED, on && cfg.hasKey && !(ledState & KEYBOARD_LED_CAPSLOCK));
 }
 
@@ -436,7 +502,8 @@ static void runCommand(String c) {
     else if (m == "off") cfg.modeOverride = 1;
     else if (m == "encrypt") cfg.modeOverride = 2;
     else if (m == "decrypt") cfg.modeOverride = 3;
-    else { Serial.println("usage: mode switch|off|encrypt|decrypt"); return; }
+    else if (m == "stealth") cfg.modeOverride = 4;
+    else { Serial.println("usage: mode switch|off|encrypt|decrypt|stealth"); return; }
     saveSettings();
     printStatus();
   } else if (c.startsWith("layout ")) {
@@ -456,7 +523,7 @@ static void runCommand(String c) {
     saveSettings(); printStatus();
   } else if (c == "clearkey") { memset(cfg.key, 0, 32); cfg.hasKey = 0; saveSettings(); printStatus(); }
   else if (c.length()) {
-    Serial.println("commands: key <passphrase> | status | mode switch|off|encrypt|decrypt | layout us|uk | os mac|windows|linux | remap off|win-mac|win-mac-ctrl | test <text> | untest <b64> | clearkey");
+    Serial.println("commands: key <passphrase> | status | mode switch|off|encrypt|decrypt|stealth | layout us|uk | os mac|windows|linux | remap off|win-mac|win-mac-ctrl | test <text> | untest <b64> | clearkey");
   }
 }
 

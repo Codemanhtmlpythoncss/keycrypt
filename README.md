@@ -1,10 +1,11 @@
-# KeyCrypt
+# pico-desktop-encryptor (KeyCrypt)
 
 A Raspberry Pi Pico that sits between your USB keyboard and your computer.
 Keys pass straight through as you type. When you press **Enter**, the Pico
 erases the line you just typed and re-types it **encrypted** (AES-256-GCM, shown as
 base64), then presses Enter. A 2-position switch picks the mode:
-**off**, **encrypt**, or **decrypt**.
+**off**, **encrypt**, **decrypt**, or **stealth** (nothing reaches the computer until
+Enter, then only the ciphertext is typed, so a keylogger on the computer never sees your text).
 
 ```
 keyboard ──USB──▶ [ Pico ] ──USB──▶ computer
@@ -57,7 +58,7 @@ Pins 18, 19 and 20 sit next to each other, so this is easy:
 | off | off | **Off** (normal keyboard) | dark |
 | **on** | off | **Encrypt** | solid |
 | off | **on** | **Decrypt** | blinking |
-| on | on | Off | dark |
+| **on** | **on** | **Stealth** | solid; flickers while text is waiting |
 
 The LED stays dark until a key is set (step 5).
 
@@ -65,7 +66,7 @@ The LED stays dark until a key is set (step 5).
 ```bash
 keycrypt mode encrypt
 ```
-Use `keycrypt mode decrypt` or `keycrypt mode off` the same way. To hand control back to the switch:
+Use `keycrypt mode decrypt`, `keycrypt mode stealth` or `keycrypt mode off` the same way. To hand control back to the switch:
 ```bash
 keycrypt mode switch
 ```
@@ -82,7 +83,7 @@ pipx ensurepath
 ```
 Close and reopen Terminal, then:
 ```bash
-pipx install git+https://github.com/Codemanhtmlpythoncss/keycrypt
+pipx install git+https://github.com/Codemanhtmlpythoncss/pico-desktop-encryptor
 ```
 
 **Linux / Windows:** install Python 3.9+ first, then:
@@ -94,7 +95,7 @@ python3 -m pipx ensurepath
 ```
 Reopen your terminal, then:
 ```bash
-pipx install git+https://github.com/Codemanhtmlpythoncss/keycrypt
+pipx install git+https://github.com/Codemanhtmlpythoncss/pico-desktop-encryptor
 ```
 
 Check it works:
@@ -171,6 +172,14 @@ If you also remap keys in macOS (Modifier Keys) or Karabiner, that applies on to
 - **Encrypt mode:** type a line and press Enter. The line becomes ciphertext and is sent.
 - **Decrypt mode:** type a ciphertext and press Enter. It turns into plaintext.
   If it can't be decrypted (wrong key, typo), your text is left as-is and Enter is sent normally.
+- **Stealth:** type a line and press Enter. **Nothing** is sent while you type: the Pico keeps
+  the text in its own memory, and on Enter types only the ciphertext, then Enter. A keylogger or
+  spyware on the computer only ever sees ciphertext. You can't see what you type on screen, so:
+  - **Backspace** deletes the last hidden character; **Esc** throws the whole hidden line away.
+  - The Pico LED flickers while hidden text is waiting.
+  - Shortcuts (Cmd/Ctrl + key), arrows, Tab etc. still go straight through.
+  - Caps Lock on = normal keyboard here too (anything hidden is discarded).
+  - No key auto-repeat, and lines over 512 characters are cut off (never leaked).
 - **Off:** a normal keyboard.
 
 ### Caps Lock = bypass
@@ -202,7 +211,7 @@ keycrypt encrypt "some secret"
 | `keycrypt flash` | install or update the firmware |
 | `keycrypt setkey` | set the passphrase on the device |
 | `keycrypt status` | show mode, key, keyboard state, and what the USB port sees |
-| `keycrypt mode encrypt\|decrypt\|off\|switch` | set the mode from the computer (`switch` = follow the switch again) |
+| `keycrypt mode encrypt\|decrypt\|stealth\|off\|switch` | set the mode from the computer (`switch` = follow the switch again) |
 | `keycrypt layout us\|uk` | the keyboard layout your computer uses |
 | `keycrypt os mac\|windows\|linux` | your computer's OS |
 | `keycrypt remap win-mac\|win-mac-ctrl\|off` | Windows keyboard on a Mac (see above) |
