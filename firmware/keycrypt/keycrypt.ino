@@ -7,6 +7,7 @@
 //   DECRYPT: typed line (base64) is erased and re-typed as plaintext (left alone if it fails)
 //   OFF:     plain keyboard
 // Mode switch: GP14 to GND = encrypt, GP15 to GND = decrypt, neither (or both) = off.
+// `keycrypt mode ...` can override the switch (saved in flash); `keycrypt mode switch` hands control back.
 // Key is set over USB serial ("key <passphrase>") and saved in flash.
 //
 // Build: Board "Raspberry Pi Pico", USB Stack "Adafruit TinyUSB", CPU 120 MHz.
@@ -46,8 +47,15 @@ static volatile uint8_t ledState = 0;      // from computer (caps lock etc)
 static volatile bool ledPending = false;
 static volatile uint8_t kbAddr = 0, kbInst = 0;
 
+// debug info about what the host port sees (written on core1)
+static volatile uint16_t dbgVid = 0, dbgPid = 0;
+static volatile uint8_t dbgHidCount = 0;
+static volatile uint32_t dbgMounts = 0, dbgReports = 0;
+static char dbgProtos[24] = "";
+
 // ---------- settings (flash) ----------
-struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; };
+// modeOverride: 0 = follow switch, 1 = off, 2 = encrypt, 3 = decrypt (set from CLI)
+struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; uint8_t modeOverride; };
 static Settings cfg;
 
 // ---------- line tracking (core0) ----------
@@ -63,6 +71,7 @@ static uint32_t lastKeyAt = 0;
 // helpers
 // =====================================================================
 static Mode readMode() {
+  if (cfg.modeOverride >= 1 && cfg.modeOverride <= 3) return (Mode)(cfg.modeOverride - 1);
   bool enc = digitalRead(PIN_SW_ENC) == LOW;
   bool dec = digitalRead(PIN_SW_DEC) == LOW;
   if (enc && !dec) return MODE_ENCRYPT;
@@ -106,6 +115,7 @@ static void typeChar(char c) {
 static void loadSettings() {
   EEPROM.get(0, cfg);
   if (cfg.magic != MAGIC) { memset(&cfg, 0, sizeof cfg); cfg.magic = MAGIC; }
+  if (cfg.modeOverride > 3) cfg.modeOverride = 0;
 }
 
 static void saveSettings() {
@@ -306,9 +316,14 @@ static void updateLed() {
 static String cmdBuf;
 
 static void printStatus() {
-  Serial.printf("KeyCrypt: mode %s, key %s, keyboard %s\r\n",
-                MODE_NAME[readMode()], cfg.hasKey ? "set" : "NOT SET",
+  Serial.printf("KeyCrypt: mode %s (%s), key %s, keyboard %s\r\n",
+                MODE_NAME[readMode()], cfg.modeOverride ? "set by CLI" : "from switch", cfg.hasKey ? "set" : "NOT SET",
                 kbAddr ? "connected" : "not connected");
+  if (dbgVid || dbgHidCount)
+    Serial.printf("  usb device %04x:%04x, hid interfaces %u (protocols: %s), reports %lu\r\n",
+                  dbgVid, dbgPid, dbgHidCount, dbgProtos, (unsigned long)dbgReports);
+  else
+    Serial.printf("  no usb device seen on GP2/GP3 (mounts so far: %lu)\r\n", (unsigned long)dbgMounts);
 }
 
 static void runCommand(String c) {
@@ -330,9 +345,20 @@ static void runCommand(String c) {
     String t = c.substring(7);
     static char pt[MAX_LINE];
     Serial.println(decryptText(t.c_str(), t.length(), pt, sizeof pt) < 0 ? "[cannot decrypt]" : pt);
+  } else if (c.startsWith("mode ")) {
+    String m = c.substring(5);
+    m.trim();
+    m.toLowerCase();
+    if (m == "switch") cfg.modeOverride = 0;
+    else if (m == "off") cfg.modeOverride = 1;
+    else if (m == "encrypt") cfg.modeOverride = 2;
+    else if (m == "decrypt") cfg.modeOverride = 3;
+    else { Serial.println("usage: mode switch|off|encrypt|decrypt"); return; }
+    saveSettings();
+    printStatus();
   } else if (c == "clearkey") { memset(cfg.key, 0, 32); cfg.hasKey = 0; saveSettings(); printStatus(); }
   else if (c.length()) {
-    Serial.println("commands: key <passphrase> | status | test <text> | untest <b64> | clearkey");
+    Serial.println("commands: key <passphrase> | status | mode switch|off|encrypt|decrypt | test <text> | untest <b64> | clearkey");
   }
 }
 
@@ -404,7 +430,25 @@ void loop1() {
 
 extern "C" {
 
+void tuh_mount_cb(uint8_t dev) {
+  uint16_t v = 0, p = 0;
+  tuh_vid_pid_get(dev, &v, &p);
+  dbgVid = v; dbgPid = p; dbgMounts++;
+}
+
+void tuh_umount_cb(uint8_t) {
+  dbgVid = dbgPid = 0; dbgHidCount = 0; dbgProtos[0] = 0;
+}
+
 void tuh_hid_mount_cb(uint8_t dev, uint8_t inst, uint8_t const*, uint16_t) {
+  // protocol: 0 none, 1 keyboard, 2 mouse
+  size_t n = strlen(dbgProtos);
+  if (n + 3 < sizeof dbgProtos) {
+    if (n) dbgProtos[n++] = ',';
+    dbgProtos[n] = '0' + tuh_hid_interface_protocol(dev, inst);
+    dbgProtos[n + 1] = 0;
+  }
+  dbgHidCount++;
   if (tuh_hid_interface_protocol(dev, inst) == HID_ITF_PROTOCOL_KEYBOARD) {
     kbAddr = dev; kbInst = inst;
     ledPending = true;  // sync caps lock LED
@@ -417,6 +461,7 @@ void tuh_hid_umount_cb(uint8_t dev, uint8_t inst) {
 }
 
 void tuh_hid_report_received_cb(uint8_t dev, uint8_t inst, uint8_t const* rep, uint16_t len) {
+  dbgReports++;
   if (tuh_hid_interface_protocol(dev, inst) == HID_ITF_PROTOCOL_KEYBOARD && len >= 8) {
     KbReport r;
     r.mod = rep[0];

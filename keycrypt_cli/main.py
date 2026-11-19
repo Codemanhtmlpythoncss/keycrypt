@@ -87,6 +87,10 @@ def cmd_status(a):
     print(talk("status"))
 
 
+def cmd_mode(a):
+    print(talk("mode " + a.mode))
+
+
 def cmd_clearkey(a):
     print(talk("clearkey"))
 
@@ -132,6 +136,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("setkey", help="set the passphrase on the device").set_defaults(f=cmd_setkey)
     sub.add_parser("status", help="show mode, key and keyboard state").set_defaults(f=cmd_status)
+    p = sub.add_parser("mode", help="set the mode from here (overrides the switch until 'mode switch')")
+    p.add_argument("mode", choices=["switch", "off", "encrypt", "decrypt"])
+    p.set_defaults(f=cmd_mode)
     sub.add_parser("clearkey", help="erase the key from the device").set_defaults(f=cmd_clearkey)
     p = sub.add_parser("decrypt", help="decrypt text (args or stdin)")
     p.add_argument("text", nargs="*")

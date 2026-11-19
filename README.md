@@ -60,7 +60,15 @@ Pins 18, 19 and 20 sit next to each other, so this is easy:
 | on | on | Off | dark |
 
 The LED stays dark until a key is set (step 5).
-No switch? Wire GP14 straight to GND for always-encrypt.
+
+**No switch? Or want to override it?** Set the mode from the computer. It's saved on the device and overrides the switch:
+```bash
+keycrypt mode encrypt
+```
+Use `keycrypt mode decrypt` or `keycrypt mode off` the same way. To hand control back to the switch:
+```bash
+keycrypt mode switch
+```
 
 ## 3. Install the `keycrypt` command
 
@@ -150,7 +158,8 @@ keycrypt encrypt "some secret"
 |---|---|
 | `keycrypt flash` | install or update the firmware |
 | `keycrypt setkey` | set the passphrase on the device |
-| `keycrypt status` | show mode, key, and keyboard state |
+| `keycrypt status` | show mode, key, keyboard state, and what the USB port sees |
+| `keycrypt mode encrypt\|decrypt\|off\|switch` | set the mode from the computer (`switch` = follow the switch again) |
 | `keycrypt clearkey` | wipe the key from the device |
 | `keycrypt encrypt TEXT` | encrypt on this computer |
 | `keycrypt decrypt TEXT` | decrypt on this computer (or from stdin) |
