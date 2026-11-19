@@ -149,7 +149,7 @@ def main():
     sub.add_parser("setkey", help="set the passphrase on the device").set_defaults(f=cmd_setkey)
     sub.add_parser("status", help="show mode, key and keyboard state").set_defaults(f=cmd_status)
     p = sub.add_parser("mode", help="set the mode from here (overrides the switch until 'mode switch')")
-    p.add_argument("mode", choices=["switch", "off", "encrypt", "decrypt"])
+    p.add_argument("mode", choices=["switch", "off", "encrypt", "decrypt", "stealth"])
     p.set_defaults(f=cmd_mode)
     p = sub.add_parser("layout", help="keyboard layout the computer uses (us or uk)")
     p.add_argument("layout", choices=["us", "uk"])
