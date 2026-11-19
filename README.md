@@ -136,6 +136,12 @@ This prints something like `KeyCrypt: mode ENCRYPT, key set, keyboard connected`
   If it can't be decrypted (wrong key, typo), your text is left as-is and Enter is sent normally.
 - **Off:** a normal keyboard.
 
+### Skip encryption for one line: Caps Lock + Enter
+
+Type normally with Caps Lock **off**, then press **Caps Lock** and then **Enter**.
+The line is sent exactly as typed, and Caps Lock is switched back off for you.
+If Caps Lock was already on while you typed, Enter works as usual (encrypt or decrypt).
+
 ### Decrypting on the computer
 
 Received some ciphertext? Copy it, then:
