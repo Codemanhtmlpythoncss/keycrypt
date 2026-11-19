@@ -129,6 +129,20 @@ keycrypt status
 ```
 This prints something like `KeyCrypt: mode ENCRYPT, key set, keyboard connected`.
 
+### Tell it your computer's layout and OS
+
+The Pico has to know how your computer turns keys into characters. Otherwise symbols like
+`£ # @ " \ ~` come out wrong. Set the layout the **computer** uses (on a Mac, this is System Settings → Keyboard → Input Sources):
+
+```bash
+keycrypt layout uk
+```
+```bash
+keycrypt os mac
+```
+Layouts: `us` (default), `uk`. OS: `mac` (default), `windows`, `linux`. Both are saved on the Pico.
+On a UK layout, `£` and Option-combos can't be tracked. Typing one sends that line unencrypted, so check it.
+
 ## 6. Use it
 
 - **Encrypt mode:** type a line and press Enter. The line becomes ciphertext and is sent.
@@ -136,11 +150,11 @@ This prints something like `KeyCrypt: mode ENCRYPT, key set, keyboard connected`
   If it can't be decrypted (wrong key, typo), your text is left as-is and Enter is sent normally.
 - **Off:** a normal keyboard.
 
-### Skip encryption for one line: Caps Lock + Enter
+### Caps Lock = bypass
 
-Type normally with Caps Lock **off**, then press **Caps Lock** and then **Enter**.
-The line is sent exactly as typed, and Caps Lock is switched back off for you.
-If Caps Lock was already on while you typed, Enter works as usual (encrypt or decrypt).
+While **Caps Lock is on**, Enter works like a normal keyboard: nothing is encrypted or decrypted.
+This beats both the switch and `keycrypt mode`. Turn Caps Lock off and the normal mode is back.
+The Pico's LED goes dark while Caps Lock is on, and `keycrypt status` shows `[CAPS LOCK ON: bypassed]`.
 
 ### Decrypting on the computer
 
@@ -166,6 +180,8 @@ keycrypt encrypt "some secret"
 | `keycrypt setkey` | set the passphrase on the device |
 | `keycrypt status` | show mode, key, keyboard state, and what the USB port sees |
 | `keycrypt mode encrypt\|decrypt\|off\|switch` | set the mode from the computer (`switch` = follow the switch again) |
+| `keycrypt layout us\|uk` | the keyboard layout your computer uses |
+| `keycrypt os mac\|windows\|linux` | your computer's OS |
 | `keycrypt clearkey` | wipe the key from the device |
 | `keycrypt encrypt TEXT` | encrypt on this computer |
 | `keycrypt decrypt TEXT` | decrypt on this computer (or from stdin) |
@@ -180,7 +196,7 @@ Set `KEYCRYPT_PASSPHRASE` in the environment to skip the passphrase prompt (for 
   Nothing is wrongly deleted, but check before you send.
 - Pasted text is invisible to the Pico, so decrypt mode only works on ciphertext you type.
   For pasted ciphertext, use `keycrypt decrypt`.
-- Assumes a **US keyboard layout** on the computer.
+- Only `us` and `uk` computer layouts are supported for now (see `keycrypt layout`).
 - Max 512 characters per line.
 - Only the main keyboard interface is passed through. Media keys and volume knobs on fancy keyboards won't work.
 
