@@ -3,7 +3,7 @@
 //  keyboard --(USB host, PIO on GP2/GP3)--> Pico --(native USB, HID keyboard)--> computer
 //
 // Keys pass straight through. On Enter, depending on the mode switch:
-//   ENCRYPT: typed line is erased and re-typed as base64(nonce|AES-256-GCM ciphertext|tag)
+//   ENCRYPT: typed line is erased and re-typed encrypted (AES-256-GCM, ChaCha20-Poly1305 or both; see crypto)
 //   DECRYPT: typed line (base64) is erased and re-typed as plaintext (left alone if it fails)
 //   OFF:     plain keyboard
 //   STEALTH: nothing reaches the computer while typing; on Enter only the ciphertext is typed
@@ -61,7 +61,11 @@ static char dbgProtos[24] = "";
 // remap (Windows keyboard on a Mac): 0 = none,
 //   1 = "win-mac":      Alt <-> Win swap (Alt = Command, Win = Option, Ctrl stays Control)
 //   2 = "win-mac-ctrl": Ctrl -> Command, Win -> Option, Alt -> Control
-struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; uint8_t modeOverride; uint8_t layout; uint8_t os; uint8_t remap; };
+struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; uint8_t modeOverride; uint8_t layout; uint8_t os; uint8_t remap;
+                  uint8_t cipher; uint8_t kdf; uint8_t salt[16]; };
+// cipher: 0 = aes (AES-256-GCM), 1 = chacha (ChaCha20-Poly1305), 2 = cascade (AES-GCM inside ChaCha20-Poly1305)
+// kdf:    0 = PBKDF2 on the Pico (fixed salt), 1 = scrypt on the computer (random salt, stored here)
+static const char* const CIPHER_NAME[] = { "aes", "chacha", "cascade" };
 static const char* const LAYOUT_NAME[] = { "us", "uk" };
 static const char* const OS_NAME[] = { "mac", "windows", "linux" };
 enum { OV_S = 1, OV_A = 2 };   // shift, alt/option
@@ -174,6 +178,8 @@ static void loadSettings() {
   if (cfg.layout > 1) cfg.layout = 0;
   if (cfg.os > 2) cfg.os = 0;
   if (cfg.remap > 2) cfg.remap = 0;
+  if (cfg.cipher > 2) cfg.cipher = 0;
+  if (cfg.kdf > 1) { cfg.kdf = 0; cfg.hasKey = 0; }
 }
 
 static void saveSettings() {
@@ -240,40 +246,125 @@ static int unbase64(const char* s, int n, uint8_t* out, int cap) {
   return o;
 }
 
-static void gcmInit(br_gcm_context& gc, br_aes_ct_ctr_keys& ctr, const uint8_t* nonce) {
-  br_aes_ct_ctr_init(&ctr, cfg.key, 32);
+// Formats
+//   legacy (cipher aes + PBKDF2 key): base64( nonce[12] | AES-256-GCM ct | tag[16] )
+//   v2: "k2." base64( hdr | body ),  hdr = cipher[1] kdf[1] (salt[16] if kdf = scrypt)
+//       aes:     nonce[12] | AES-256-GCM(Ka) ct | tag[16]
+//       chacha:  nonce[12] | ChaCha20-Poly1305(Kc) ct | tag[16]
+//       cascade: ChaCha20-Poly1305(Kc) over the whole aes body
+//       Ka = HMAC-SHA256(key, "keycrypt aes"), Kc = HMAC-SHA256(key, "keycrypt chacha"); hdr is AAD.
+static const int MAX_CT = 18 + 12 + 12 + MAX_LINE + 16 + 16;
+
+static void subkey(const char* label, uint8_t out[32]) {
+  br_hmac_key_context kc;
+  br_hmac_key_init(&kc, &br_sha256_vtable, cfg.key, 32);
+  br_hmac_context hc;
+  br_hmac_init(&hc, &kc, 0);
+  br_hmac_update(&hc, label, strlen(label));
+  br_hmac_out(&hc, out);
+}
+
+static void randBytes(uint8_t* p, int n) {
+  for (int i = 0; i < n; i += 4) { uint32_t r = rp2040.hwrand32(); memcpy(p + i, &r, n - i < 4 ? n - i : 4); }
+}
+
+// in place: p = nonce | data[n] | tag ; encrypt fills nonce + tag. returns false on bad tag.
+static bool aesGcm(const uint8_t key[32], uint8_t* p, size_t n, const uint8_t* aad, size_t aadLen, bool enc) {
+  if (enc) randBytes(p, 12);
+  br_aes_ct_ctr_keys ctr;
+  br_gcm_context gc;
+  br_aes_ct_ctr_init(&ctr, key, 32);
   br_gcm_init(&gc, &ctr.vtable, br_ghash_ctmul32);
-  br_gcm_reset(&gc, nonce, 12);
+  br_gcm_reset(&gc, p, 12);
+  if (aadLen) br_gcm_aad_inject(&gc, aad, aadLen);
   br_gcm_flip(&gc);
+  br_gcm_run(&gc, enc, p + 12, n);
+  if (enc) { br_gcm_get_tag(&gc, p + 12 + n); return true; }
+  return br_gcm_check_tag(&gc, p + 12 + n);
 }
 
-// returns base64(nonce[12] | ciphertext | tag[16])
+static bool chachaPoly(const uint8_t key[32], uint8_t* p, size_t n, const uint8_t* aad, size_t aadLen, bool enc) {
+  if (enc) randBytes(p, 12);
+  uint8_t tag[16];
+  br_poly1305_ctmul_run(key, p, p + 12, n, aad, aadLen, tag, br_chacha20_ct_run, enc);
+  if (enc) { memcpy(p + 12 + n, tag, 16); return true; }
+  uint8_t d = 0;
+  for (int i = 0; i < 16; i++) d |= tag[i] ^ p[12 + n + i];
+  return d == 0;
+}
+
+static int headerLen(uint8_t kdf) { return kdf == 1 ? 18 : 2; }
+
 static String encryptText(const char* txt, size_t n) {
-  static uint8_t buf[12 + MAX_LINE + 16];
+  static uint8_t buf[MAX_CT];
   if (n > MAX_LINE) n = MAX_LINE;
-  for (int i = 0; i < 12; i += 4) { uint32_t r = rp2040.hwrand32(); memcpy(buf + i, &r, 4); }
-  memcpy(buf + 12, txt, n);
-  br_aes_ct_ctr_keys ctr;
-  br_gcm_context gc;
-  gcmInit(gc, ctr, buf);
-  br_gcm_run(&gc, 1, buf + 12, n);
-  br_gcm_get_tag(&gc, buf + 12 + n);
-  return base64(buf, 12 + n + 16);
+  if (cfg.cipher == 0 && cfg.kdf == 0) {             // legacy format, master key directly
+    memcpy(buf + 12, txt, n);
+    aesGcm(cfg.key, buf, n, nullptr, 0, true);
+    return base64(buf, 12 + n + 16);
+  }
+  int h = headerLen(cfg.kdf);
+  buf[0] = cfg.cipher; buf[1] = cfg.kdf;
+  if (cfg.kdf == 1) memcpy(buf + 2, cfg.salt, 16);
+  uint8_t ka[32], kc[32];
+  subkey("keycrypt aes", ka);
+  subkey("keycrypt chacha", kc);
+  uint8_t* body = buf + h;
+  size_t len;
+  if (cfg.cipher == 1) {
+    memcpy(body + 12, txt, n);
+    chachaPoly(kc, body, n, buf, h, true);
+    len = 12 + n + 16;
+  } else if (cfg.cipher == 2) {                       // inner aes body sits inside the chacha body
+    memcpy(body + 24, txt, n);
+    aesGcm(ka, body + 12, n, buf, h, true);
+    chachaPoly(kc, body, 12 + n + 16, buf, h, true);
+    len = 12 + 12 + n + 16 + 16;
+  } else {
+    memcpy(body + 12, txt, n);
+    aesGcm(ka, body, n, buf, h, true);
+    len = 12 + n + 16;
+  }
+  memset(ka, 0, 32); memset(kc, 0, 32);
+  return "k2." + base64(buf, h + len);
 }
 
-// decrypts base64 text into out (NUL-terminated). returns plaintext length or -1.
+// decrypts text into out (NUL-terminated). returns plaintext length or -1.
 static int decryptText(const char* b64, int n, char* out, int cap) {
-  static uint8_t buf[MAX_LINE];
-  int len = unbase64(b64, n, buf, sizeof buf);
-  if (len < 12 + 16) return -1;
-  int ptLen = len - 28;
+  static uint8_t buf[MAX_CT];
+  const uint8_t* pt;
+  int ptLen;
+  if (n > 3 && !strncmp(b64, "k2.", 3)) {
+    int len = unbase64(b64 + 3, n - 3, buf, sizeof buf);
+    if (len < 2 || buf[0] > 2 || buf[1] != cfg.kdf) return -1;   // made with a different kind of key
+    int h = headerLen(buf[1]);
+    if (h == 18 && (len < 18 || memcmp(buf + 2, cfg.salt, 16))) return -1;  // different scrypt key
+    uint8_t ka[32], kc[32];
+    subkey("keycrypt aes", ka);
+    subkey("keycrypt chacha", kc);
+    uint8_t* body = buf + h;
+    int bl = len - h;
+    bool ok = false;
+    if (buf[0] == 1 && bl >= 28) {
+      ok = chachaPoly(kc, body, bl - 28, buf, h, false); pt = body + 12; ptLen = bl - 28;
+    } else if (buf[0] == 2 && bl >= 56) {
+      ok = chachaPoly(kc, body, bl - 28, buf, h, false) && aesGcm(ka, body + 12, bl - 56, buf, h, false);
+      pt = body + 24; ptLen = bl - 56;
+    } else if (buf[0] == 0 && bl >= 28) {
+      ok = aesGcm(ka, body, bl - 28, buf, h, false); pt = body + 12; ptLen = bl - 28;
+    }
+    memset(ka, 0, 32); memset(kc, 0, 32);
+    if (!ok) return -1;
+  } else {
+    if (cfg.kdf != 0) return -1;                      // legacy text needs a PBKDF2 key
+    int len = unbase64(b64, n, buf, sizeof buf);
+    if (len < 28) return -1;
+    ptLen = len - 28;
+    if (!aesGcm(cfg.key, buf, ptLen, nullptr, 0, false)) return -1;
+    pt = buf + 12;
+  }
   if (ptLen >= cap) return -1;
-  br_aes_ct_ctr_keys ctr;
-  br_gcm_context gc;
-  gcmInit(gc, ctr, buf);
-  br_gcm_run(&gc, 0, buf + 12, ptLen);
-  if (!br_gcm_check_tag(&gc, buf + 12 + ptLen)) return -1;
-  memcpy(out, buf + 12, ptLen);
+  memcpy(out, pt, ptLen);
   out[ptLen] = 0;
   return ptLen;
 }
@@ -467,6 +558,8 @@ static void printStatus() {
                 kbAddr ? "connected" : "not connected");
   Serial.printf("  computer layout %s, os %s, modifier remap %s\r\n", LAYOUT_NAME[cfg.layout], OS_NAME[cfg.os],
                 cfg.remap == 1 ? "win-mac" : cfg.remap == 2 ? "win-mac-ctrl" : "off");
+  Serial.printf("  cipher %s, key made with %s\r\n", CIPHER_NAME[cfg.cipher],
+                cfg.kdf ? "scrypt (on computer, random salt)" : "PBKDF2 (on Pico)");
   Serial.printf("  last modifiers: from keyboard 0x%02x -> sent 0x%02x\r\n", dbgModRaw, dbgModSent);
   if (dbgVid || dbgHidCount)
     Serial.printf("  usb device %04x:%04x, hid interfaces %u (protocols: %s), reports %lu\r\n",
@@ -482,8 +575,30 @@ static void runCommand(String c) {
     Serial.println("deriving key...");
     pbkdf2_sha256(p.c_str(), cfg.key);
     cfg.hasKey = 1;
+    cfg.kdf = 0;
     saveSettings();
     Serial.println("key saved");
+  } else if (c.startsWith("rawkey ")) {     // rawkey <64 hex key> <32 hex salt>: key made by scrypt on the computer
+    String a = c.substring(7); a.trim();
+    uint8_t tmp[48];
+    bool ok = a.length() == 64 + 1 + 32 && a[64] == ' ';
+    for (int i = 0, j = 0; ok && i < 48; i++, j += 2) {
+      if (j == 64) j++;
+      char hx[3] = { a[j], a[j + 1], 0 };
+      char* e;
+      tmp[i] = strtol(hx, &e, 16);
+      ok = *e == 0 && isxdigit((unsigned char)hx[0]) && isxdigit((unsigned char)hx[1]);
+    }
+    if (!ok) { Serial.println("usage: rawkey <64 hex> <32 hex>"); return; }
+    memcpy(cfg.key, tmp, 32); memcpy(cfg.salt, tmp + 32, 16); memset(tmp, 0, sizeof tmp);
+    cfg.hasKey = 1; cfg.kdf = 1;
+    saveSettings();
+    Serial.println("key saved");
+  } else if (c.startsWith("cipher ")) {
+    String v = c.substring(7); v.trim(); v.toLowerCase();
+    if (v == "aes") cfg.cipher = 0; else if (v == "chacha") cfg.cipher = 1; else if (v == "cascade") cfg.cipher = 2;
+    else { Serial.println("usage: cipher aes|chacha|cascade"); return; }
+    saveSettings(); printStatus();
   } else if (c == "status") printStatus();
   else if (c.startsWith("test ")) {
     if (!cfg.hasKey) { Serial.println("no key set"); return; }
@@ -521,9 +636,9 @@ static void runCommand(String c) {
     if (v == "off") cfg.remap = 0; else if (v == "win-mac") cfg.remap = 1; else if (v == "win-mac-ctrl") cfg.remap = 2;
     else { Serial.println("usage: remap off|win-mac|win-mac-ctrl"); return; }
     saveSettings(); printStatus();
-  } else if (c == "clearkey") { memset(cfg.key, 0, 32); cfg.hasKey = 0; saveSettings(); printStatus(); }
+  } else if (c == "clearkey") { memset(cfg.key, 0, 32); memset(cfg.salt, 0, 16); cfg.hasKey = 0; cfg.kdf = 0; saveSettings(); printStatus(); }
   else if (c.length()) {
-    Serial.println("commands: key <passphrase> | status | mode switch|off|encrypt|decrypt|stealth | layout us|uk | os mac|windows|linux | remap off|win-mac|win-mac-ctrl | test <text> | untest <b64> | clearkey");
+    Serial.println("commands: key <passphrase> | rawkey <hex> <salthex> | cipher aes|chacha|cascade | status | mode switch|off|encrypt|decrypt|stealth | layout us|uk | os mac|windows|linux | remap off|win-mac|win-mac-ctrl | test <text> | untest <b64> | clearkey");
   }
 }
 

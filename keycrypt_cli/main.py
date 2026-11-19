@@ -14,9 +14,24 @@ SALT, ITERS = b"keycrypt-v1", 50000
 
 
 # ---------------------------------------------------------------- crypto
-def derive(pw: str):
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    return AESGCM(hashlib.pbkdf2_hmac("sha256", pw.encode(), SALT, ITERS, 32))
+# legacy: base64(nonce|AES-GCM ct|tag), key = PBKDF2 with fixed salt
+# v2:     "k2." base64(cipher kdf [salt16] | body), see firmware for the layout
+CIPHERS = ["aes", "chacha", "cascade"]
+SCRYPT = dict(n=2 ** 17, r=8, p=1, maxmem=256 * 1024 * 1024, dklen=32)
+
+
+def pbkdf2_key(pw: str) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), SALT, ITERS, 32)
+
+
+def scrypt_key(pw: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(pw.encode(), salt=salt, **SCRYPT)
+
+
+def subkeys(key: bytes):
+    import hmac
+    return (hmac.new(key, b"keycrypt aes", "sha256").digest(),
+            hmac.new(key, b"keycrypt chacha", "sha256").digest())
 
 
 def ask_pass(confirm=False):
@@ -36,24 +51,69 @@ def inputs(args_text):
     return [l.strip() for l in sys.stdin.read().splitlines() if l.strip()]
 
 
+def seal(pt: bytes, key: bytes, cipher: str, kdf: int, salt: bytes = b"") -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+    if cipher == "aes" and kdf == 0:
+        n = os.urandom(12)
+        return base64.b64encode(n + AESGCM(key).encrypt(n, pt, None)).decode()
+    hdr = bytes([CIPHERS.index(cipher), kdf]) + (salt if kdf == 1 else b"")
+    ka, kc = subkeys(key)
+    if cipher in ("aes", "cascade"):
+        n = os.urandom(12)
+        pt = n + AESGCM(ka).encrypt(n, pt, hdr)
+    if cipher in ("chacha", "cascade"):
+        n = os.urandom(12)
+        pt = n + ChaCha20Poly1305(kc).encrypt(n, pt, hdr)
+    return "k2." + base64.b64encode(hdr + pt).decode()
+
+
+def unseal(word: str, pw: str, cache: dict) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+    if "pbkdf2" not in cache:
+        cache["pbkdf2"] = pbkdf2_key(pw)
+    if not word.startswith("k2."):
+        raw = base64.b64decode(word, validate=True)
+        return AESGCM(cache["pbkdf2"]).decrypt(raw[:12], raw[12:], None).decode()
+    raw = base64.b64decode(word[3:], validate=True)
+    cipher, kdf = CIPHERS[raw[0]], raw[1]
+    if kdf == 1:
+        hdr, body = raw[:18], raw[18:]
+        if hdr[2:] not in cache:
+            cache[hdr[2:]] = scrypt_key(pw, hdr[2:])
+        key = cache[hdr[2:]]
+    elif kdf == 0:
+        hdr, body, key = raw[:2], raw[2:], cache["pbkdf2"]
+    else:
+        raise ValueError("unknown key type")
+    ka, kc = subkeys(key)
+    if cipher in ("chacha", "cascade"):
+        body = ChaCha20Poly1305(kc).decrypt(body[:12], body[12:], hdr)
+    if cipher in ("aes", "cascade"):
+        body = AESGCM(ka).decrypt(body[:12], body[12:], hdr)
+    return body.decode()
+
+
 def cmd_decrypt(a):
     items = inputs(a.text)
-    key = derive(ask_pass())
+    pw, cache = ask_pass(), {}
     for ct in items:
         for word in ct.split():  # allow several ciphertexts on one line
             try:
-                raw = base64.b64decode(word, validate=True)
-                print(key.decrypt(raw[:12], raw[12:], None).decode())
+                print(unseal(word, pw, cache))
             except Exception:
                 print("[cannot decrypt: wrong key or damaged text]")
 
 
 def cmd_encrypt(a):
     items = inputs(a.text)
-    key = derive(ask_pass())
+    pw = ask_pass()
+    if a.kdf == "scrypt":
+        salt = os.urandom(16)
+        key, kdf = scrypt_key(pw, salt), 1
+    else:
+        salt, key, kdf = b"", pbkdf2_key(pw), 0
     for pt in items:
-        nonce = os.urandom(12)
-        print(base64.b64encode(nonce + key.encrypt(nonce, pt.encode(), None)).decode())
+        print(seal(pt.encode(), key, a.cipher, kdf, salt))
 
 
 # ---------------------------------------------------------------- device
@@ -79,8 +139,18 @@ def talk(cmd, wait=1.0):
 
 def cmd_setkey(a):
     pw = ask_pass(confirm=True)
-    print("saving key on device (takes a few seconds)...")
-    print(talk("key " + pw, 8))
+    if a.kdf == "pbkdf2":
+        print("saving key on device (takes a few seconds)...")
+        print(talk("key " + pw, 8))
+        return
+    print("making key with scrypt (strong, takes a second)...")
+    salt = os.urandom(16)
+    key = scrypt_key(pw, salt)
+    print(talk(f"rawkey {key.hex()} {salt.hex()}", 1.5))
+
+
+def cmd_cipher(a):
+    print(talk("cipher " + a.cipher))
 
 
 def cmd_status(a):
@@ -146,7 +216,13 @@ def cmd_flash(a):
 def main():
     ap = argparse.ArgumentParser(prog="keycrypt", description="Control the KeyCrypt Pico keyboard.")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("setkey", help="set the passphrase on the device").set_defaults(f=cmd_setkey)
+    p = sub.add_parser("setkey", help="set the passphrase on the device")
+    p.add_argument("--kdf", choices=["scrypt", "pbkdf2"], default="scrypt",
+                   help="scrypt (default, strong, made on this computer) or pbkdf2 (old, made on the Pico)")
+    p.set_defaults(f=cmd_setkey)
+    p = sub.add_parser("cipher", help="encryption the device uses: aes, chacha, cascade (aes inside chacha)")
+    p.add_argument("cipher", choices=CIPHERS)
+    p.set_defaults(f=cmd_cipher)
     sub.add_parser("status", help="show mode, key and keyboard state").set_defaults(f=cmd_status)
     p = sub.add_parser("mode", help="set the mode from here (overrides the switch until 'mode switch')")
     p.add_argument("mode", choices=["switch", "off", "encrypt", "decrypt", "stealth"])
@@ -166,6 +242,9 @@ def main():
     p.add_argument("text", nargs="*")
     p.set_defaults(f=cmd_decrypt)
     p = sub.add_parser("encrypt", help="encrypt text on this computer (args or stdin)")
+    p.add_argument("--cipher", choices=CIPHERS, default="aes")
+    p.add_argument("--kdf", choices=["pbkdf2", "scrypt"], default="pbkdf2",
+                   help="scrypt output can only be decrypted with the CLI (new random salt)")
     p.add_argument("text", nargs="*")
     p.set_defaults(f=cmd_encrypt)
     p = sub.add_parser("flash", help="install the KeyCrypt firmware on a Pico")
