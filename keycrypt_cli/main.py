@@ -99,6 +99,10 @@ def cmd_os(a):
     print(talk("os " + a.os))
 
 
+def cmd_remap(a):
+    print(talk("remap " + a.remap))
+
+
 def cmd_clearkey(a):
     print(talk("clearkey"))
 
@@ -153,6 +157,10 @@ def main():
     p = sub.add_parser("os", help="operating system of the computer (mac, windows, linux)")
     p.add_argument("os", choices=["mac", "windows", "linux"])
     p.set_defaults(f=cmd_os)
+    p = sub.add_parser("remap", help="Windows keyboard on a Mac. win-mac: Alt<->Win swap; "
+                                     "win-mac-ctrl: Ctrl=Cmd, Win=Option, Alt=Ctrl; off")
+    p.add_argument("remap", choices=["off", "win-mac", "win-mac-ctrl"])
+    p.set_defaults(f=cmd_remap)
     sub.add_parser("clearkey", help="erase the key from the device").set_defaults(f=cmd_clearkey)
     p = sub.add_parser("decrypt", help="decrypt text (args or stdin)")
     p.add_argument("text", nargs="*")

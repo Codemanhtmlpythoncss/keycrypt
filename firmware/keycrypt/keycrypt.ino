@@ -57,7 +57,10 @@ static char dbgProtos[24] = "";
 // ---------- settings (flash) ----------
 // modeOverride: 0 = follow switch, 1 = off, 2 = encrypt, 3 = decrypt (set from CLI)
 // layout: 0 = US, 1 = UK.  os: 0 = mac, 1 = windows, 2 = linux  (how the COMPUTER is set up)
-struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; uint8_t modeOverride; uint8_t layout; uint8_t os; };
+// remap (Windows keyboard on a Mac): 0 = none,
+//   1 = "win-mac":      Alt <-> Win swap (Alt = Command, Win = Option, Ctrl stays Control)
+//   2 = "win-mac-ctrl": Ctrl -> Command, Win -> Option, Alt -> Control
+struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; uint8_t modeOverride; uint8_t layout; uint8_t os; uint8_t remap; };
 static const char* const LAYOUT_NAME[] = { "us", "uk" };
 static const char* const OS_NAME[] = { "mac", "windows", "linux" };
 enum { OV_S = 1, OV_A = 2 };   // shift, alt/option
@@ -168,6 +171,7 @@ static void loadSettings() {
   if (cfg.modeOverride > 3) cfg.modeOverride = 0;
   if (cfg.layout > 1) cfg.layout = 0;
   if (cfg.os > 2) cfg.os = 0;
+  if (cfg.remap > 2) cfg.remap = 0;
 }
 
 static void saveSettings() {
@@ -309,7 +313,26 @@ static void resetLine() {
   lineLen = 0; tracking = true; lastKey = 0;
 }
 
+static volatile uint8_t dbgModRaw = 0, dbgModSent = 0;
+
+// map each modifier bit (L and R side) through a table: index 0 ctrl, 1 shift, 2 alt, 3 gui
+static uint8_t remapMods(uint8_t m) {
+  static const uint8_t MAPS[3][4] = {
+    { 0, 1, 2, 3 },   // none
+    { 0, 1, 3, 2 },   // win-mac:      alt <-> gui
+    { 3, 1, 0, 2 },   // win-mac-ctrl: ctrl->gui, alt->ctrl, gui->alt
+  };
+  const uint8_t* map = MAPS[cfg.remap <= 2 ? cfg.remap : 0];
+  uint8_t out = 0;
+  for (int side = 0; side < 2; side++)
+    for (int b = 0; b < 4; b++)
+      if (m & (1 << (side * 4 + b))) out |= 1 << (side * 4 + map[b]);
+  if (m) { dbgModRaw = m; dbgModSent = out; }
+  return out;
+}
+
 static void handleReport(KbReport r) {
+  r.mod = remapMods(r.mod);
   bool ctrlAltGui = r.mod & ~(KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
   bool ctrlGui = r.mod & (KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTCTRL |
                           KEYBOARD_MODIFIER_LEFTGUI | KEYBOARD_MODIFIER_RIGHTGUI);
@@ -376,7 +399,9 @@ static void printStatus() {
                 MODE_NAME[readMode()], cfg.modeOverride ? "set by CLI" : "from switch",
                 (ledState & KEYBOARD_LED_CAPSLOCK) ? " [CAPS LOCK ON: bypassed]" : "", cfg.hasKey ? "set" : "NOT SET",
                 kbAddr ? "connected" : "not connected");
-  Serial.printf("  computer layout %s, os %s\r\n", LAYOUT_NAME[cfg.layout], OS_NAME[cfg.os]);
+  Serial.printf("  computer layout %s, os %s, modifier remap %s\r\n", LAYOUT_NAME[cfg.layout], OS_NAME[cfg.os],
+                cfg.remap == 1 ? "win-mac" : cfg.remap == 2 ? "win-mac-ctrl" : "off");
+  Serial.printf("  last modifiers: from keyboard 0x%02x -> sent 0x%02x\r\n", dbgModRaw, dbgModSent);
   if (dbgVid || dbgHidCount)
     Serial.printf("  usb device %04x:%04x, hid interfaces %u (protocols: %s), reports %lu\r\n",
                   dbgVid, dbgPid, dbgHidCount, dbgProtos, (unsigned long)dbgReports);
@@ -424,9 +449,14 @@ static void runCommand(String c) {
     if (v == "mac") cfg.os = 0; else if (v == "windows") cfg.os = 1; else if (v == "linux") cfg.os = 2;
     else { Serial.println("usage: os mac|windows|linux"); return; }
     saveSettings(); printStatus();
+  } else if (c.startsWith("remap ")) {
+    String v = c.substring(6); v.trim(); v.toLowerCase();
+    if (v == "off") cfg.remap = 0; else if (v == "win-mac") cfg.remap = 1; else if (v == "win-mac-ctrl") cfg.remap = 2;
+    else { Serial.println("usage: remap off|win-mac|win-mac-ctrl"); return; }
+    saveSettings(); printStatus();
   } else if (c == "clearkey") { memset(cfg.key, 0, 32); cfg.hasKey = 0; saveSettings(); printStatus(); }
   else if (c.length()) {
-    Serial.println("commands: key <passphrase> | status | mode switch|off|encrypt|decrypt | layout us|uk | os mac|windows|linux | test <text> | untest <b64> | clearkey");
+    Serial.println("commands: key <passphrase> | status | mode switch|off|encrypt|decrypt | layout us|uk | os mac|windows|linux | remap off|win-mac|win-mac-ctrl | test <text> | untest <b64> | clearkey");
   }
 }
 

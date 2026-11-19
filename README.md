@@ -143,6 +143,29 @@ keycrypt os mac
 Layouts: `us` (default), `uk`. OS: `mac` (default), `windows`, `linux`. Both are saved on the Pico.
 On a UK layout, `£` and Option-combos can't be tracked. Typing one sends that line unencrypted, so check it.
 
+### Windows keyboard on a Mac
+
+Two remaps are available. Keyboards differ, so try one, and if the keys come out wrong, use the other:
+
+```bash
+keycrypt remap win-mac
+```
+`win-mac` swaps Alt ↔ Windows key, so Alt acts as Command and Win as Option.
+On the AULA F2088 this gives **Ctrl → Command, Alt → Control, Win → Option**.
+
+```bash
+keycrypt remap win-mac-ctrl
+```
+`win-mac-ctrl` sends Ctrl as Command, Win as Option, and Alt as Control.
+
+To turn remapping off:
+```bash
+keycrypt remap off
+```
+Not sure what your keyboard sends? Hold a modifier key and run `keycrypt status` in another window. The
+`last modifiers` line shows what the keyboard sent and what the Pico passed on.
+If you also remap keys in macOS (Modifier Keys) or Karabiner, that applies on top.
+
 ## 6. Use it
 
 - **Encrypt mode:** type a line and press Enter. The line becomes ciphertext and is sent.
@@ -182,6 +205,7 @@ keycrypt encrypt "some secret"
 | `keycrypt mode encrypt\|decrypt\|off\|switch` | set the mode from the computer (`switch` = follow the switch again) |
 | `keycrypt layout us\|uk` | the keyboard layout your computer uses |
 | `keycrypt os mac\|windows\|linux` | your computer's OS |
+| `keycrypt remap win-mac\|win-mac-ctrl\|off` | Windows keyboard on a Mac (see above) |
 | `keycrypt clearkey` | wipe the key from the device |
 | `keycrypt encrypt TEXT` | encrypt on this computer |
 | `keycrypt decrypt TEXT` | decrypt on this computer (or from stdin) |
@@ -214,7 +238,7 @@ brew install arduino-cli
 arduino-cli config add board_manager.additional_urls https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
 ```
 ```bash
-arduino-cli core update-index && arduino-cli core install rp2040:rp2040 && arduino-cli lib install "Pico PIO USB"
+arduino-cli core update-index && arduino-cli core install rp2040:rp2040@6.4.0 && arduino-cli lib install "Pico PIO USB@0.7.3"
 ```
 ```bash
 ./scripts/build-firmware.sh
@@ -225,6 +249,22 @@ keycrypt flash --file build/keycrypt.ino.uf2
 
 Firmware: [`firmware/keycrypt/keycrypt.ino`](firmware/keycrypt/keycrypt.ino) · CLI: [`keycrypt_cli/main.py`](keycrypt_cli/main.py)
 
+## Open source
+
+Everything here is open source: the firmware ([`firmware/keycrypt/keycrypt.ino`](firmware/keycrypt/keycrypt.ino)),
+the CLI, and the build script. The prebuilt `keycrypt.uf2` (in the CLI package and on the
+[Releases](../../releases) page) is built from this repo with the steps above, and you can rebuild and reflash it yourself.
+
+The firmware is built on these open-source projects:
+
+| Project | Used for | License |
+|---|---|---|
+| [arduino-pico](https://github.com/earlephilhower/arduino-pico) 6.4.0 (incl. Pico SDK) | RP2040 core | LGPL-2.1 (Pico SDK: BSD-3) |
+| [Adafruit TinyUSB](https://github.com/adafruit/Adafruit_TinyUSB_Arduino) (bundled with the core) | USB keyboard + host stack | MIT |
+| [Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB) 0.7.3 | USB host on GP2/GP3 | MIT |
+| [BearSSL](https://bearssl.org/) (bundled with the core) | AES-GCM, SHA-256, HMAC | MIT |
+| [pyserial](https://github.com/pyserial/pyserial), [cryptography](https://github.com/pyca/cryptography) | CLI | BSD / Apache-2.0 |
+
 ## License
 
-MIT
+KeyCrypt is [MIT](LICENSE).
