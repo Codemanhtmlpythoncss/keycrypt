@@ -3,7 +3,7 @@
 //  keyboard --(USB host, PIO on GP2/GP3)--> Pico --(native USB, HID keyboard)--> computer
 //
 // Keys pass straight through. On Enter, depending on the mode switch:
-//   ENCRYPT: typed line is erased and re-typed as base64(nonce|AES-256-GCM ciphertext|tag)
+//   ENCRYPT: typed line is erased and re-typed encrypted (AES-256-GCM, ChaCha20-Poly1305 or both; see crypto)
 //   DECRYPT: typed line (base64) is erased and re-typed as plaintext (left alone if it fails)
 //   OFF:     plain keyboard
 //   STEALTH: nothing reaches the computer while typing; on Enter only the ciphertext is typed
@@ -38,6 +38,9 @@ static const char* const MODE_NAME[] = { "OFF", "ENCRYPT", "DECRYPT", "STEALTH" 
 Adafruit_USBH_Host USBHost;
 Adafruit_USBD_HID usb_hid;
 static const uint8_t hid_desc[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
+// media keys / volume knob: second HID interface to the computer (consumer control, report id 1)
+Adafruit_USBD_HID usb_media;
+static const uint8_t media_desc[] = { TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(1)) };
 
 static const uint8_t keycode2ascii[128][2] = { HID_KEYCODE_TO_ASCII };
 static const uint8_t ascii2keycode[128][2] = { HID_ASCII_TO_KEYCODE };
@@ -45,6 +48,15 @@ static const uint8_t ascii2keycode[128][2] = { HID_ASCII_TO_KEYCODE };
 // ---------- cross-core state ----------
 struct KbReport { uint8_t mod; uint8_t keys[6]; };
 static queue_t reportQ;
+static queue_t mediaQ;   // consumer usages (uint16_t) from keyboard -> computer, 0 = released
+
+// what each report id on each keyboard interface carries (filled at mount, from the report descriptor)
+struct RepInfo { uint8_t inst, id, page; };
+static RepInfo repInfo[16];
+static volatile uint8_t repInfoN = 0;
+// debug: last raw reports from non-keyboard interfaces
+static uint8_t dbgRaw[8][10];
+static volatile uint8_t dbgRawN = 0;
 static volatile uint8_t ledState = 0;      // from computer (caps lock etc)
 static volatile bool ledPending = false;
 static volatile uint8_t kbAddr = 0, kbInst = 0;
@@ -61,7 +73,13 @@ static char dbgProtos[24] = "";
 // remap (Windows keyboard on a Mac): 0 = none,
 //   1 = "win-mac":      Alt <-> Win swap (Alt = Command, Win = Option, Ctrl stays Control)
 //   2 = "win-mac-ctrl": Ctrl -> Command, Win -> Option, Alt -> Control
-struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; uint8_t modeOverride; uint8_t layout; uint8_t os; uint8_t remap; };
+struct Settings { uint32_t magic; uint8_t hasKey; uint8_t key[32]; uint8_t modeOverride; uint8_t layout; uint8_t os; uint8_t remap;
+                  uint8_t cipher; uint8_t kdf; uint8_t salt[16]; };
+// cipher: 0 = aes (AES-256-GCM), 1 = chacha (ChaCha20-Poly1305), 2 = cascade (AES-GCM inside ChaCha20-Poly1305)
+// kdf:    0 = PBKDF2 on the Pico (fixed salt). Made on the computer, salt = key id:
+//         1 = scrypt(passphrase), 2 = random key, 3 = scrypt(passphrase + secret code)
+static const char* const KDF_NAME[] = { "PBKDF2 (on Pico)", "scrypt passphrase", "random key", "passphrase + secret code" };
+static const char* const CIPHER_NAME[] = { "aes", "chacha", "cascade" };
 static const char* const LAYOUT_NAME[] = { "us", "uk" };
 static const char* const OS_NAME[] = { "mac", "windows", "linux" };
 enum { OV_S = 1, OV_A = 2 };   // shift, alt/option
@@ -174,6 +192,8 @@ static void loadSettings() {
   if (cfg.layout > 1) cfg.layout = 0;
   if (cfg.os > 2) cfg.os = 0;
   if (cfg.remap > 2) cfg.remap = 0;
+  if (cfg.cipher > 2) cfg.cipher = 0;
+  if (cfg.kdf > 3) { cfg.kdf = 0; cfg.hasKey = 0; }
 }
 
 static void saveSettings() {
@@ -240,40 +260,125 @@ static int unbase64(const char* s, int n, uint8_t* out, int cap) {
   return o;
 }
 
-static void gcmInit(br_gcm_context& gc, br_aes_ct_ctr_keys& ctr, const uint8_t* nonce) {
-  br_aes_ct_ctr_init(&ctr, cfg.key, 32);
+// Formats
+//   legacy (cipher aes + PBKDF2 key): base64( nonce[12] | AES-256-GCM ct | tag[16] )
+//   v2: "k2." base64( hdr | body ),  hdr = cipher[1] kdf[1] (key id[16] if kdf != 0)
+//       aes:     nonce[12] | AES-256-GCM(Ka) ct | tag[16]
+//       chacha:  nonce[12] | ChaCha20-Poly1305(Kc) ct | tag[16]
+//       cascade: ChaCha20-Poly1305(Kc) over the whole aes body
+//       Ka = HMAC-SHA256(key, "keycrypt aes"), Kc = HMAC-SHA256(key, "keycrypt chacha"); hdr is AAD.
+static const int MAX_CT = 18 + 12 + 12 + MAX_LINE + 16 + 16;
+
+static void subkey(const char* label, uint8_t out[32]) {
+  br_hmac_key_context kc;
+  br_hmac_key_init(&kc, &br_sha256_vtable, cfg.key, 32);
+  br_hmac_context hc;
+  br_hmac_init(&hc, &kc, 0);
+  br_hmac_update(&hc, label, strlen(label));
+  br_hmac_out(&hc, out);
+}
+
+static void randBytes(uint8_t* p, int n) {
+  for (int i = 0; i < n; i += 4) { uint32_t r = rp2040.hwrand32(); memcpy(p + i, &r, n - i < 4 ? n - i : 4); }
+}
+
+// in place: p = nonce | data[n] | tag ; encrypt fills nonce + tag. returns false on bad tag.
+static bool aesGcm(const uint8_t key[32], uint8_t* p, size_t n, const uint8_t* aad, size_t aadLen, bool enc) {
+  if (enc) randBytes(p, 12);
+  br_aes_ct_ctr_keys ctr;
+  br_gcm_context gc;
+  br_aes_ct_ctr_init(&ctr, key, 32);
   br_gcm_init(&gc, &ctr.vtable, br_ghash_ctmul32);
-  br_gcm_reset(&gc, nonce, 12);
+  br_gcm_reset(&gc, p, 12);
+  if (aadLen) br_gcm_aad_inject(&gc, aad, aadLen);
   br_gcm_flip(&gc);
+  br_gcm_run(&gc, enc, p + 12, n);
+  if (enc) { br_gcm_get_tag(&gc, p + 12 + n); return true; }
+  return br_gcm_check_tag(&gc, p + 12 + n);
 }
 
-// returns base64(nonce[12] | ciphertext | tag[16])
+static bool chachaPoly(const uint8_t key[32], uint8_t* p, size_t n, const uint8_t* aad, size_t aadLen, bool enc) {
+  if (enc) randBytes(p, 12);
+  uint8_t tag[16];
+  br_poly1305_ctmul_run(key, p, p + 12, n, aad, aadLen, tag, br_chacha20_ct_run, enc);
+  if (enc) { memcpy(p + 12 + n, tag, 16); return true; }
+  uint8_t d = 0;
+  for (int i = 0; i < 16; i++) d |= tag[i] ^ p[12 + n + i];
+  return d == 0;
+}
+
+static int headerLen(uint8_t kdf) { return kdf ? 18 : 2; }
+
 static String encryptText(const char* txt, size_t n) {
-  static uint8_t buf[12 + MAX_LINE + 16];
+  static uint8_t buf[MAX_CT];
   if (n > MAX_LINE) n = MAX_LINE;
-  for (int i = 0; i < 12; i += 4) { uint32_t r = rp2040.hwrand32(); memcpy(buf + i, &r, 4); }
-  memcpy(buf + 12, txt, n);
-  br_aes_ct_ctr_keys ctr;
-  br_gcm_context gc;
-  gcmInit(gc, ctr, buf);
-  br_gcm_run(&gc, 1, buf + 12, n);
-  br_gcm_get_tag(&gc, buf + 12 + n);
-  return base64(buf, 12 + n + 16);
+  if (cfg.cipher == 0 && cfg.kdf == 0) {             // legacy format, master key directly
+    memcpy(buf + 12, txt, n);
+    aesGcm(cfg.key, buf, n, nullptr, 0, true);
+    return base64(buf, 12 + n + 16);
+  }
+  int h = headerLen(cfg.kdf);
+  buf[0] = cfg.cipher; buf[1] = cfg.kdf;
+  if (cfg.kdf) memcpy(buf + 2, cfg.salt, 16);
+  uint8_t ka[32], kc[32];
+  subkey("keycrypt aes", ka);
+  subkey("keycrypt chacha", kc);
+  uint8_t* body = buf + h;
+  size_t len;
+  if (cfg.cipher == 1) {
+    memcpy(body + 12, txt, n);
+    chachaPoly(kc, body, n, buf, h, true);
+    len = 12 + n + 16;
+  } else if (cfg.cipher == 2) {                       // inner aes body sits inside the chacha body
+    memcpy(body + 24, txt, n);
+    aesGcm(ka, body + 12, n, buf, h, true);
+    chachaPoly(kc, body, 12 + n + 16, buf, h, true);
+    len = 12 + 12 + n + 16 + 16;
+  } else {
+    memcpy(body + 12, txt, n);
+    aesGcm(ka, body, n, buf, h, true);
+    len = 12 + n + 16;
+  }
+  memset(ka, 0, 32); memset(kc, 0, 32);
+  return "k2." + base64(buf, h + len);
 }
 
-// decrypts base64 text into out (NUL-terminated). returns plaintext length or -1.
+// decrypts text into out (NUL-terminated). returns plaintext length or -1.
 static int decryptText(const char* b64, int n, char* out, int cap) {
-  static uint8_t buf[MAX_LINE];
-  int len = unbase64(b64, n, buf, sizeof buf);
-  if (len < 12 + 16) return -1;
-  int ptLen = len - 28;
+  static uint8_t buf[MAX_CT];
+  const uint8_t* pt;
+  int ptLen;
+  if (n > 3 && !strncmp(b64, "k2.", 3)) {
+    int len = unbase64(b64 + 3, n - 3, buf, sizeof buf);
+    if (len < 2 || buf[0] > 2 || buf[1] != cfg.kdf) return -1;   // made with a different kind of key
+    int h = headerLen(buf[1]);
+    if (h == 18 && (len < 18 || memcmp(buf + 2, cfg.salt, 16))) return -1;  // different scrypt key
+    uint8_t ka[32], kc[32];
+    subkey("keycrypt aes", ka);
+    subkey("keycrypt chacha", kc);
+    uint8_t* body = buf + h;
+    int bl = len - h;
+    bool ok = false;
+    if (buf[0] == 1 && bl >= 28) {
+      ok = chachaPoly(kc, body, bl - 28, buf, h, false); pt = body + 12; ptLen = bl - 28;
+    } else if (buf[0] == 2 && bl >= 56) {
+      ok = chachaPoly(kc, body, bl - 28, buf, h, false) && aesGcm(ka, body + 12, bl - 56, buf, h, false);
+      pt = body + 24; ptLen = bl - 56;
+    } else if (buf[0] == 0 && bl >= 28) {
+      ok = aesGcm(ka, body, bl - 28, buf, h, false); pt = body + 12; ptLen = bl - 28;
+    }
+    memset(ka, 0, 32); memset(kc, 0, 32);
+    if (!ok) return -1;
+  } else {
+    if (cfg.kdf != 0) return -1;                      // legacy text needs a PBKDF2 key
+    int len = unbase64(b64, n, buf, sizeof buf);
+    if (len < 28) return -1;
+    ptLen = len - 28;
+    if (!aesGcm(cfg.key, buf, ptLen, nullptr, 0, false)) return -1;
+    pt = buf + 12;
+  }
   if (ptLen >= cap) return -1;
-  br_aes_ct_ctr_keys ctr;
-  br_gcm_context gc;
-  gcmInit(gc, ctr, buf);
-  br_gcm_run(&gc, 0, buf + 12, ptLen);
-  if (!br_gcm_check_tag(&gc, buf + 12 + ptLen)) return -1;
-  memcpy(out, buf + 12, ptLen);
+  memcpy(out, pt, ptLen);
   out[ptLen] = 0;
   return ptLen;
 }
@@ -467,6 +572,7 @@ static void printStatus() {
                 kbAddr ? "connected" : "not connected");
   Serial.printf("  computer layout %s, os %s, modifier remap %s\r\n", LAYOUT_NAME[cfg.layout], OS_NAME[cfg.os],
                 cfg.remap == 1 ? "win-mac" : cfg.remap == 2 ? "win-mac-ctrl" : "off");
+  Serial.printf("  cipher %s, key type: %s\r\n", CIPHER_NAME[cfg.cipher], KDF_NAME[cfg.kdf]);
   Serial.printf("  last modifiers: from keyboard 0x%02x -> sent 0x%02x\r\n", dbgModRaw, dbgModSent);
   if (dbgVid || dbgHidCount)
     Serial.printf("  usb device %04x:%04x, hid interfaces %u (protocols: %s), reports %lu\r\n",
@@ -482,8 +588,59 @@ static void runCommand(String c) {
     Serial.println("deriving key...");
     pbkdf2_sha256(p.c_str(), cfg.key);
     cfg.hasKey = 1;
+    cfg.kdf = 0;
     saveSettings();
     Serial.println("key saved");
+  } else if (c.startsWith("rawkey ")) {     // rawkey <64 hex key> <32 hex id> [kdf 1-3]: key made on the computer
+    String a = c.substring(7); a.trim();
+    uint8_t kdf = 1;
+    if (a.length() == 64 + 1 + 32 + 2 && a[97] == ' ' && a[98] >= '1' && a[98] <= '3') { kdf = a[98] - '0'; a.remove(97); }
+    uint8_t tmp[48];
+    bool ok = a.length() == 64 + 1 + 32 && a[64] == ' ';
+    for (int i = 0, j = 0; ok && i < 48; i++, j += 2) {
+      if (j == 64) j++;
+      char hx[3] = { a[j], a[j + 1], 0 };
+      char* e;
+      tmp[i] = strtol(hx, &e, 16);
+      ok = *e == 0 && isxdigit((unsigned char)hx[0]) && isxdigit((unsigned char)hx[1]);
+    }
+    if (!ok) { Serial.println("usage: rawkey <64 hex> <32 hex>"); return; }
+    memcpy(cfg.key, tmp, 32); memcpy(cfg.salt, tmp + 32, 16); memset(tmp, 0, sizeof tmp);
+    cfg.hasKey = 1; cfg.kdf = kdf;
+    saveSettings();
+    Serial.println("key saved");
+  } else if (c == "readkey") {             // hands the key out only after a physical BOOTSEL press
+    if (!cfg.hasKey) { Serial.println("no key set"); return; }
+    Serial.println("press BOOTSEL on the Pico within 15 s to show the key");
+    uint32_t t0 = millis();
+    bool pressed = false;
+    while (millis() - t0 < 15000 && !(pressed = BOOTSEL)) {
+      digitalWrite(STATUS_LED, (millis() / 100) % 2);
+      delay(100);
+    }
+    if (!pressed) { Serial.println("cancelled: BOOTSEL not pressed"); return; }
+    Serial.printf("KEY %u ", cfg.kdf);
+    for (int i = 0; i < 16; i++) Serial.printf("%02x", cfg.kdf ? cfg.salt[i] : 0);
+    Serial.print(' ');
+    for (int i = 0; i < 32; i++) Serial.printf("%02x", cfg.key[i]);
+    Serial.println();
+  } else if (c == "usbdump") {
+    for (int i = 0; i < repInfoN; i++)
+      Serial.printf("  interface %u report id %u: usage page 0x%02x%s\r\n", repInfo[i].inst, repInfo[i].id,
+                    repInfo[i].page, repInfo[i].page == HID_USAGE_PAGE_CONSUMER ? " (media)" : "");
+    int n = dbgRawN < 8 ? dbgRawN : 8;
+    Serial.printf("  last %d raw reports from extra interfaces (newest last):\r\n", n);
+    for (int k = dbgRawN - n; k < dbgRawN; k++) {
+      uint8_t* r = dbgRaw[k % 8];
+      Serial.print("   ");
+      for (int j = 0; j < r[0] && j < 9; j++) Serial.printf(" %02x", r[1 + j]);
+      Serial.println();
+    }
+  } else if (c.startsWith("cipher ")) {
+    String v = c.substring(7); v.trim(); v.toLowerCase();
+    if (v == "aes") cfg.cipher = 0; else if (v == "chacha") cfg.cipher = 1; else if (v == "cascade") cfg.cipher = 2;
+    else { Serial.println("usage: cipher aes|chacha|cascade"); return; }
+    saveSettings(); printStatus();
   } else if (c == "status") printStatus();
   else if (c.startsWith("test ")) {
     if (!cfg.hasKey) { Serial.println("no key set"); return; }
@@ -521,9 +678,9 @@ static void runCommand(String c) {
     if (v == "off") cfg.remap = 0; else if (v == "win-mac") cfg.remap = 1; else if (v == "win-mac-ctrl") cfg.remap = 2;
     else { Serial.println("usage: remap off|win-mac|win-mac-ctrl"); return; }
     saveSettings(); printStatus();
-  } else if (c == "clearkey") { memset(cfg.key, 0, 32); cfg.hasKey = 0; saveSettings(); printStatus(); }
+  } else if (c == "clearkey") { memset(cfg.key, 0, 32); memset(cfg.salt, 0, 16); cfg.hasKey = 0; cfg.kdf = 0; saveSettings(); printStatus(); }
   else if (c.length()) {
-    Serial.println("commands: key <passphrase> | status | mode switch|off|encrypt|decrypt|stealth | layout us|uk | os mac|windows|linux | remap off|win-mac|win-mac-ctrl | test <text> | untest <b64> | clearkey");
+    Serial.println("commands: key <passphrase> | rawkey <hex> <idhex> [1-3] | readkey | usbdump | cipher aes|chacha|cascade | status | mode switch|off|encrypt|decrypt|stealth | layout us|uk | os mac|windows|linux | remap off|win-mac|win-mac-ctrl | test <text> | untest <b64> | clearkey");
   }
 }
 
@@ -548,6 +705,7 @@ void setup() {
   pinMode(PIN_SW_DEC, INPUT_PULLUP);
   pinMode(STATUS_LED, OUTPUT);
   queue_init(&reportQ, sizeof(KbReport), 64);
+  queue_init(&mediaQ, sizeof(uint16_t), 32);
   EEPROM.begin(256);
   loadSettings();
 
@@ -557,6 +715,10 @@ void setup() {
   usb_hid.setStringDescriptor("KeyCrypt Keyboard");
   usb_hid.setReportCallback(NULL, hid_set_report_cb);
   usb_hid.begin();
+  usb_media.setPollInterval(2);
+  usb_media.setReportDescriptor(media_desc, sizeof(media_desc));
+  usb_media.setStringDescriptor("KeyCrypt Media Keys");
+  usb_media.begin();
   if (TinyUSBDevice.mounted()) { TinyUSBDevice.detach(); delay(10); TinyUSBDevice.attach(); }
 
   Serial.begin(115200);
@@ -565,6 +727,11 @@ void setup() {
 void loop() {
   KbReport r;
   while (queue_try_remove(&reportQ, &r)) handleReport(r);
+  uint16_t usage;
+  while (queue_try_remove(&mediaQ, &usage)) {   // media keys pass straight through in every mode
+    for (int i = 0; i < 20 && !usb_media.ready(); i++) delay(1);
+    usb_media.sendReport16(1, usage);
+  }
   checkAutoRepeat();
   updateLed();
   pollSerial();
@@ -593,6 +760,23 @@ void loop1() {
   }
 }
 
+static void learnReports(uint8_t inst, uint8_t const* desc, uint16_t len) {
+  tuh_hid_report_info_t info[8];
+  uint8_t n = tuh_hid_parse_report_descriptor(info, 8, desc, len);
+  for (uint8_t i = 0; i < n && repInfoN < 16; i++)
+    repInfo[repInfoN++] = { inst, info[i].report_id, (uint8_t)info[i].usage_page };
+}
+
+static int reportPage(uint8_t inst, uint8_t id) {
+  for (int i = 0; i < repInfoN; i++) if (repInfo[i].inst == inst && repInfo[i].id == id) return repInfo[i].page;
+  return -1;
+}
+
+static bool instHasIds(uint8_t inst) {
+  for (int i = 0; i < repInfoN; i++) if (repInfo[i].inst == inst && repInfo[i].id) return true;
+  return false;
+}
+
 extern "C" {
 
 void tuh_mount_cb(uint8_t dev) {
@@ -602,10 +786,11 @@ void tuh_mount_cb(uint8_t dev) {
 }
 
 void tuh_umount_cb(uint8_t) {
-  dbgVid = dbgPid = 0; dbgHidCount = 0; dbgProtos[0] = 0;
+  dbgVid = dbgPid = 0; dbgHidCount = 0; dbgProtos[0] = 0; repInfoN = 0;
 }
 
-void tuh_hid_mount_cb(uint8_t dev, uint8_t inst, uint8_t const*, uint16_t) {
+void tuh_hid_mount_cb(uint8_t dev, uint8_t inst, uint8_t const* desc, uint16_t descLen) {
+  if (tuh_hid_interface_protocol(dev, inst) != HID_ITF_PROTOCOL_KEYBOARD) learnReports(inst, desc, descLen);
   // protocol: 0 none, 1 keyboard, 2 mouse
   size_t n = strlen(dbgProtos);
   if (n + 3 < sizeof dbgProtos) {
@@ -632,6 +817,20 @@ void tuh_hid_report_received_cb(uint8_t dev, uint8_t inst, uint8_t const* rep, u
     r.mod = rep[0];
     memcpy(r.keys, rep + 2, 6);
     queue_try_add(&reportQ, &r);
+  } else if (tuh_hid_interface_protocol(dev, inst) != HID_ITF_PROTOCOL_KEYBOARD && len) {
+    uint8_t slot = dbgRawN % 8;
+    memset(dbgRaw[slot], 0, 10);
+    dbgRaw[slot][0] = len;
+    memcpy(dbgRaw[slot] + 1, rep, len < 9 ? len : 9);
+    dbgRawN++;
+    bool ids = instHasIds(inst);
+    uint8_t id = ids ? rep[0] : 0;
+    const uint8_t* d = ids ? rep + 1 : rep;
+    int dl = ids ? len - 1 : len;
+    if (reportPage(inst, id) == HID_USAGE_PAGE_CONSUMER && dl >= 1) {
+      uint16_t usage = d[0] | (dl >= 2 ? d[1] << 8 : 0);   // 16-bit usage (0 = released)
+      queue_try_add(&mediaQ, &usage);
+    }
   }
   tuh_hid_receive_report(dev, inst);
 }
