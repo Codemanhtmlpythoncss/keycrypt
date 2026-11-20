@@ -7,8 +7,10 @@
 //   DECRYPT: typed line (base64) is erased and re-typed as plaintext (left alone if it fails)
 //   OFF:     plain keyboard
 //   STEALTH: nothing reaches the computer while typing; on Enter only the ciphertext is typed
+//   PASSWORD: like stealth, but the output is the same every time for the same text (passphrase -> long password)
 // Bypass: while Caps Lock is ON, Enter is sent normally (overrides CLI mode and switch).
 // Mode switch: GP14 to GND = encrypt, GP15 to GND = decrypt, both = stealth, neither = off.
+// Switch 3: GP13 to GND = password mode (beats switches 1 + 2).
 // `keycrypt mode ...` can override the switch (saved in flash); `keycrypt mode switch` hands control back.
 // Key is set over USB serial ("key <passphrase>") and saved in flash.
 //
@@ -24,6 +26,7 @@
 #define HOST_PIN_DP     2        // USB D+ on GP2, D- must be GP3
 #define PIN_SW_ENC      14       // switch 1 -> GND = encrypt
 #define PIN_SW_DEC      15       // switch 2 -> GND = decrypt
+#define PIN_SW_PW       13       // switch 3 -> GND = password mode (beats switches 1 + 2)
 #define STATUS_LED      25       // onboard LED (Pico, not Pico W)
 #define MAX_LINE        512      // longest line we track
 #define REPEAT_MS       400      // key held this long -> OS auto-repeat, stop tracking
@@ -31,8 +34,8 @@
 static const char PBKDF2_SALT[] = "keycrypt-v1";
 static const uint32_t MAGIC = 0x4B435932;  // "KCY2"
 
-enum Mode { MODE_OFF, MODE_ENCRYPT, MODE_DECRYPT, MODE_STEALTH };
-static const char* const MODE_NAME[] = { "OFF", "ENCRYPT", "DECRYPT", "STEALTH" };
+enum Mode { MODE_OFF, MODE_ENCRYPT, MODE_DECRYPT, MODE_STEALTH, MODE_PASSWORD };
+static const char* const MODE_NAME[] = { "OFF", "ENCRYPT", "DECRYPT", "STEALTH", "PASSWORD" };
 
 // ---------- USB objects ----------
 Adafruit_USBH_Host USBHost;
@@ -68,7 +71,7 @@ static volatile uint32_t dbgMounts = 0, dbgReports = 0;
 static char dbgProtos[24] = "";
 
 // ---------- settings (flash) ----------
-// modeOverride: 0 = follow switch, 1 = off, 2 = encrypt, 3 = decrypt, 4 = stealth (set from CLI)
+// modeOverride: 0 = follow switch, 1 = off, 2 = encrypt, 3 = decrypt, 4 = stealth, 5 = password (set from CLI)
 // layout: 0 = US, 1 = UK.  os: 0 = mac, 1 = windows, 2 = linux  (how the COMPUTER is set up)
 // remap (Windows keyboard on a Mac): 0 = none,
 //   1 = "win-mac":      Alt <-> Win swap (Alt = Command, Win = Option, Ctrl stays Control)
@@ -99,7 +102,8 @@ static uint32_t lastKeyAt = 0;
 // helpers
 // =====================================================================
 static Mode readMode() {
-  if (cfg.modeOverride >= 1 && cfg.modeOverride <= 4) return (Mode)(cfg.modeOverride - 1);
+  if (cfg.modeOverride >= 1 && cfg.modeOverride <= 5) return (Mode)(cfg.modeOverride - 1);
+  if (digitalRead(PIN_SW_PW) == LOW) return MODE_PASSWORD;
   bool enc = digitalRead(PIN_SW_ENC) == LOW;
   bool dec = digitalRead(PIN_SW_DEC) == LOW;
   if (enc && !dec) return MODE_ENCRYPT;
@@ -188,7 +192,7 @@ static void typeChar(char c) {
 static void loadSettings() {
   EEPROM.get(0, cfg);
   if (cfg.magic != MAGIC) { memset(&cfg, 0, sizeof cfg); cfg.magic = MAGIC; }
-  if (cfg.modeOverride > 4) cfg.modeOverride = 0;
+  if (cfg.modeOverride > 5) cfg.modeOverride = 0;
   if (cfg.layout > 1) cfg.layout = 0;
   if (cfg.os > 2) cfg.os = 0;
   if (cfg.remap > 2) cfg.remap = 0;
@@ -286,8 +290,8 @@ static void randBytes(uint8_t* p, int n) {
 }
 
 // in place: p = nonce | data[n] | tag ; encrypt fills nonce + tag. returns false on bad tag.
+// nonce (first 12 bytes of p) must already be set when encrypting
 static bool aesGcm(const uint8_t key[32], uint8_t* p, size_t n, const uint8_t* aad, size_t aadLen, bool enc) {
-  if (enc) randBytes(p, 12);
   br_aes_ct_ctr_keys ctr;
   br_gcm_context gc;
   br_aes_ct_ctr_init(&ctr, key, 32);
@@ -301,7 +305,6 @@ static bool aesGcm(const uint8_t key[32], uint8_t* p, size_t n, const uint8_t* a
 }
 
 static bool chachaPoly(const uint8_t key[32], uint8_t* p, size_t n, const uint8_t* aad, size_t aadLen, bool enc) {
-  if (enc) randBytes(p, 12);
   uint8_t tag[16];
   br_poly1305_ctmul_run(key, p, p + 12, n, aad, aadLen, tag, br_chacha20_ct_run, enc);
   if (enc) { memcpy(p + 12 + n, tag, 16); return true; }
@@ -317,6 +320,7 @@ static String encryptText(const char* txt, size_t n) {
   if (n > MAX_LINE) n = MAX_LINE;
   if (cfg.cipher == 0 && cfg.kdf == 0) {             // legacy format, master key directly
     memcpy(buf + 12, txt, n);
+    randBytes(buf, 12);
     aesGcm(cfg.key, buf, n, nullptr, 0, true);
     return base64(buf, 12 + n + 16);
   }
@@ -330,15 +334,18 @@ static String encryptText(const char* txt, size_t n) {
   size_t len;
   if (cfg.cipher == 1) {
     memcpy(body + 12, txt, n);
+    randBytes(body, 12);
     chachaPoly(kc, body, n, buf, h, true);
     len = 12 + n + 16;
   } else if (cfg.cipher == 2) {                       // inner aes body sits inside the chacha body
     memcpy(body + 24, txt, n);
+    randBytes(body, 24);
     aesGcm(ka, body + 12, n, buf, h, true);
     chachaPoly(kc, body, 12 + n + 16, buf, h, true);
     len = 12 + 12 + n + 16 + 16;
   } else {
     memcpy(body + 12, txt, n);
+    randBytes(body, 12);
     aesGcm(ka, body, n, buf, h, true);
     len = 12 + n + 16;
   }
@@ -346,7 +353,83 @@ static String encryptText(const char* txt, size_t n) {
   return "k2." + base64(buf, h + len);
 }
 
+// ---------- password mode: same input + key -> same output (no random nonce) ----------
+// Synthetic IV: nonce = HMAC-SHA256(Kn, label | data)[:12], Kn = HMAC-SHA256(key, "keycrypt siv").
+// Different texts get different nonces, so it stays safe; identical texts give identical output (the point).
+// Output has no header (it's a password): base64( body ), body as in v2 with AAD "keycrypt-pw".
+static const char PW_AAD[] = "keycrypt-pw";
+#define PW_AAD_LEN (sizeof(PW_AAD) - 1)
+
+static void sivNonce(const uint8_t kn[32], char label, const uint8_t* d, size_t n, uint8_t out[12]) {
+  br_hmac_key_context kc;
+  br_hmac_key_init(&kc, &br_sha256_vtable, kn, 32);
+  br_hmac_context hc;
+  br_hmac_init(&hc, &kc, 0);
+  br_hmac_update(&hc, &label, 1);
+  br_hmac_update(&hc, d, n);
+  uint8_t m[32];
+  br_hmac_out(&hc, m);
+  memcpy(out, m, 12);
+}
+
+static String passwordText(const char* txt, size_t n) {
+  static uint8_t buf[MAX_CT];
+  if (n > MAX_LINE) n = MAX_LINE;
+  uint8_t ka[32], kc[32], kn[32];
+  subkey("keycrypt aes", ka); subkey("keycrypt chacha", kc); subkey("keycrypt siv", kn);
+  const uint8_t* aad = (const uint8_t*)PW_AAD;
+  size_t len;
+  if (cfg.cipher == 1) {
+    memcpy(buf + 12, txt, n);
+    sivNonce(kn, 'c', buf + 12, n, buf);
+    chachaPoly(kc, buf, n, aad, PW_AAD_LEN, true);
+    len = 12 + n + 16;
+  } else if (cfg.cipher == 2) {
+    memcpy(buf + 24, txt, n);
+    sivNonce(kn, 'a', buf + 24, n, buf + 12);
+    aesGcm(ka, buf + 12, n, aad, PW_AAD_LEN, true);
+    sivNonce(kn, 'c', buf + 12, 12 + n + 16, buf);
+    chachaPoly(kc, buf, 12 + n + 16, aad, PW_AAD_LEN, true);
+    len = 12 + 12 + n + 16 + 16;
+  } else {
+    memcpy(buf + 12, txt, n);
+    sivNonce(kn, 'a', buf + 12, n, buf);
+    aesGcm(ka, buf, n, aad, PW_AAD_LEN, true);
+    len = 12 + n + 16;
+  }
+  memset(ka, 0, 32); memset(kc, 0, 32); memset(kn, 0, 32);
+  return base64(buf, len);
+}
+
+// tries every password-mode cipher on raw bytes; returns plaintext length (pt set) or -1
+static int passwordOpen(const uint8_t* raw, int len, uint8_t* work, const uint8_t** pt) {
+  uint8_t ka[32], kc[32];
+  subkey("keycrypt aes", ka); subkey("keycrypt chacha", kc);
+  const uint8_t* aad = (const uint8_t*)PW_AAD;
+  int r = -1;
+  if (len >= 28) {                                        // aes
+    memcpy(work, raw, len);
+    if (aesGcm(ka, work, len - 28, aad, PW_AAD_LEN, false)) { *pt = work + 12; r = len - 28; }
+  }
+  if (r < 0) {                                            // outer chacha: cascade or chacha
+    memcpy(work, raw, len);
+    if (chachaPoly(kc, work, len - 28, aad, PW_AAD_LEN, false)) {
+      // inner is decrypted in place at work+12; if it is itself an aes layer, it's cascade.
+      // aes decrypts in place too, so check on a copy first.
+      static uint8_t inner[MAX_CT];
+      int in = len - 28;
+      memcpy(inner, work + 12, in);
+      if (in >= 28 && aesGcm(ka, inner, in - 28, aad, PW_AAD_LEN, false)) {
+        memcpy(work, inner + 12, in - 28); *pt = work; r = in - 28;
+      } else { *pt = work + 12; r = in; }
+    }
+  }
+  memset(ka, 0, 32); memset(kc, 0, 32);
+  return r;
+}
+
 // decrypts text into out (NUL-terminated). returns plaintext length or -1.
+// Tries every method that fits; only one whose authentication tag checks out is accepted.
 static int decryptText(const char* b64, int n, char* out, int cap) {
   static uint8_t buf[MAX_CT];
   const uint8_t* pt;
@@ -372,13 +455,17 @@ static int decryptText(const char* b64, int n, char* out, int cap) {
     }
     memset(ka, 0, 32); memset(kc, 0, 32);
     if (!ok) return -1;
-  } else {
-    if (cfg.kdf != 0) return -1;                      // legacy text needs a PBKDF2 key
+  } else {                                            // no header: legacy, or password mode
+    static uint8_t work[MAX_CT];
     int len = unbase64(b64, n, buf, sizeof buf);
     if (len < 28) return -1;
-    ptLen = len - 28;
-    if (!aesGcm(cfg.key, buf, ptLen, nullptr, 0, false)) return -1;
-    pt = buf + 12;
+    ptLen = -1;
+    if (cfg.kdf == 0) {                               // legacy text needs a PBKDF2 key
+      memcpy(work, buf, len);
+      if (aesGcm(cfg.key, work, len - 28, nullptr, 0, false)) { pt = work + 12; ptLen = len - 28; }
+    }
+    if (ptLen < 0) ptLen = passwordOpen(buf, len, work, &pt);
+    if (ptLen < 0) return -1;
   }
   if (ptLen >= cap) return -1;
   memcpy(out, pt, ptLen);
@@ -449,6 +536,7 @@ static uint8_t remapMods(uint8_t m) {
 // and stay hidden until released; everything else (arrows, shortcuts...) passes through.
 static uint8_t captured[6];
 static bool wasStealth = false;
+static bool hiddenIsPassword = false;   // hidden-typing mode is password (true) or stealth (false)
 
 static bool isCaptured(uint8_t k) {
   for (int i = 0; i < 6; i++) if (captured[i] == k) return true;
@@ -468,7 +556,7 @@ static void handleStealth(KbReport r) {
     if ((k == HID_KEY_ENTER || k == HID_KEY_KEYPAD_ENTER) && !ctrlGui) {
       take = true;
       if (lineLen > 0) {
-        String out = encryptText(line, lineLen);
+        String out = hiddenIsPassword ? passwordText(line, lineLen) : encryptText(line, lineLen);
         typeLine(out.c_str(), out.length(), 0);
       } else {
         tapKey(0, HID_KEY_ENTER);
@@ -498,7 +586,9 @@ static void handleStealth(KbReport r) {
 
 static void handleReport(KbReport r) {
   r.mod = remapMods(r.mod);
-  bool stealth = readMode() == MODE_STEALTH && cfg.hasKey && !(ledState & KEYBOARD_LED_CAPSLOCK);
+  Mode m = readMode();
+  bool stealth = (m == MODE_STEALTH || m == MODE_PASSWORD) && cfg.hasKey && !(ledState & KEYBOARD_LED_CAPSLOCK);
+  if (stealth && hiddenIsPassword != (m == MODE_PASSWORD)) { hiddenIsPassword = m == MODE_PASSWORD; resetLine(); }
   if (stealth != wasStealth) {   // entering/leaving stealth: pending hidden text is discarded
     wasStealth = stealth;
     resetLine();
@@ -567,12 +657,21 @@ static void pumpKeyboard() {
   checkAutoRepeat();
 }
 
-// LED: solid = encrypt, blink = decrypt, off = off
+// LED is lit whenever the Pico is running, so you can see it is working.
+// Short dark dips show the mode; it never goes fully dark while running.
 static void updateLed() {
-  Mode m = readMode();
-  bool on = m == MODE_ENCRYPT || (m == MODE_DECRYPT && (millis() / 250) % 2) ||
-            (m == MODE_STEALTH && (lineLen == 0 || (millis() / 80) % 2));  // stealth: flicker = text waiting
-  digitalWrite(STATUS_LED, on && cfg.hasKey && !(ledState & KEYBOARD_LED_CAPSLOCK));
+  uint32_t t = millis();
+  uint32_t ph = t % 1000;
+  bool on = true;
+  if (!cfg.hasKey) on = (t / 500) % 2;                          // no key yet: slow blink
+  else if (!(ledState & KEYBOARD_LED_CAPSLOCK)) {
+    Mode m = readMode();
+    if ((m == MODE_STEALTH || m == MODE_PASSWORD) && lineLen > 0)
+      on = (t / 80) % 2;                                         // hidden text waiting: flicker
+    else if (m == MODE_DECRYPT) on = ph >= 100;                   // 1 dip / second
+    else if (m == MODE_PASSWORD) on = !(ph < 100 || (ph >= 200 && ph < 300));  // 2 dips / second
+  }
+  digitalWrite(STATUS_LED, on);
 }
 
 // =====================================================================
@@ -664,6 +763,10 @@ static void runCommand(String c) {
     if (!cfg.hasKey) { Serial.println("no key set"); return; }
     String t = c.substring(5);
     Serial.println(encryptText(t.c_str(), t.length()));
+  } else if (c.startsWith("pwtest ")) {
+    if (!cfg.hasKey) { Serial.println("no key set"); return; }
+    String t = c.substring(7);
+    Serial.println(passwordText(t.c_str(), t.length()));
   } else if (c.startsWith("untest ")) {
     if (!cfg.hasKey) { Serial.println("no key set"); return; }
     String t = c.substring(7);
@@ -678,7 +781,8 @@ static void runCommand(String c) {
     else if (m == "encrypt") cfg.modeOverride = 2;
     else if (m == "decrypt") cfg.modeOverride = 3;
     else if (m == "stealth") cfg.modeOverride = 4;
-    else { Serial.println("usage: mode switch|off|encrypt|decrypt|stealth"); return; }
+    else if (m == "password") cfg.modeOverride = 5;
+    else { Serial.println("usage: mode switch|off|encrypt|decrypt|stealth|password"); return; }
     saveSettings();
     printStatus();
   } else if (c.startsWith("layout ")) {
@@ -698,7 +802,7 @@ static void runCommand(String c) {
     saveSettings(); printStatus();
   } else if (c == "clearkey") { memset(cfg.key, 0, 32); memset(cfg.salt, 0, 16); cfg.hasKey = 0; cfg.kdf = 0; saveSettings(); printStatus(); }
   else if (c.length()) {
-    Serial.println("commands: key <passphrase> | rawkey <hex> <idhex> [1-3] | readkey | usbdump | cipher aes|chacha|cascade | status | mode switch|off|encrypt|decrypt|stealth | layout us|uk | os mac|windows|linux | remap off|win-mac|win-mac-ctrl | test <text> | untest <b64> | clearkey");
+    Serial.println("commands: key <passphrase> | rawkey <hex> <idhex> [1-3] | readkey | usbdump | cipher aes|chacha|cascade | status | mode switch|off|encrypt|decrypt|stealth|password | layout us|uk | os mac|windows|linux | remap off|win-mac|win-mac-ctrl | test <text> | pwtest <text> | untest <b64> | clearkey");
   }
 }
 
@@ -721,6 +825,7 @@ static void hid_set_report_cb(uint8_t, hid_report_type_t type, uint8_t const* bu
 void setup() {
   pinMode(PIN_SW_ENC, INPUT_PULLUP);
   pinMode(PIN_SW_DEC, INPUT_PULLUP);
+  pinMode(PIN_SW_PW, INPUT_PULLUP);
   pinMode(STATUS_LED, OUTPUT);
   queue_init(&reportQ, sizeof(KbReport), 64);
   queue_init(&mediaQ, sizeof(uint16_t), 32);

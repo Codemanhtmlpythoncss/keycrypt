@@ -52,21 +52,28 @@ Pins 18, 19 and 20 sit next to each other, so this is easy:
 | common side of **both** switches | **GND**, pin 18 |
 | other side of switch **1** (ENC) | **GP14**, pin 19 |
 | other side of switch **2** (DEC) | **GP15**, pin 20 |
+| *(optional)* switch **3** (PASSWORD): one side | **GP13**, pin 17 |
+| *(optional)* switch **3**: other side | **GND**, pin 18 (same as above) |
+
+Switch 3 is optional. With only 2 switches (or switch 3 off) nothing changes, and you can still
+use password mode with `keycrypt mode password`. Switch 3 on beats switches 1 and 2.
 
 | Switch 1 | Switch 2 | Mode | Pico LED |
 |---|---|---|---|
-| off | off | **Off** (normal keyboard) | dark |
+| off | off | **Off** (normal keyboard) | solid |
 | **on** | off | **Encrypt** | solid |
-| off | **on** | **Decrypt** | blinking |
+| off | **on** | **Decrypt** | solid, 1 short dip each second |
 | **on** | **on** | **Stealth** | solid; flickers while text is waiting |
+| switch 3 on | (any) | **Password** | solid, 2 short dips each second; flickers while text is waiting |
 
-The LED stays dark until a key is set (step 5).
+The LED is lit whenever the Pico is running, so you can see it is working. Until a key is set
+(step 5) it blinks slowly. `keycrypt status` always shows the exact mode.
 
 **No switch? Or want to override it?** Set the mode from the computer. It's saved on the device and overrides the switch:
 ```bash
 keycrypt mode encrypt
 ```
-Use `keycrypt mode decrypt`, `keycrypt mode stealth` or `keycrypt mode off` the same way. To hand control back to the switch:
+Use `keycrypt mode decrypt`, `keycrypt mode stealth`, `keycrypt mode password` or `keycrypt mode off` the same way. To hand control back to the switch:
 ```bash
 keycrypt mode switch
 ```
@@ -245,13 +252,24 @@ If you also remap keys in macOS (Modifier Keys) or Karabiner, that applies on to
   - Shortcuts (Cmd/Ctrl + key), arrows, Tab etc. still go straight through.
   - Caps Lock on = normal keyboard here too (anything hidden is discarded).
   - No key auto-repeat, and lines over 512 characters are cut off (never leaked).
+- **Password:** turns a passphrase you can remember into a long, strong password. Works like
+  stealth (nothing sent while you type, Backspace/Esc work), but there is **no random number** in
+  the output: the same text with the same key gives the **same output every time**. So type
+  `my bank pass` on Enter and you always get the same ~60-100 character password to use.
+  - Output has no `k2.` header (so it's a clean password). It only uses `A-Z a-z 0-9 + / =`.
+  - The output depends on the key **and** the cipher: change either and every password changes.
+    Keep a copy of your key (`keycrypt readkey`) or you lose these passwords.
+  - Make the same password on the computer: `keycrypt encrypt --password "my bank pass"`
+    (uses the same cipher flag: `--cipher cascade` if the device is on cascade).
+  - Trade-off: someone who sees two outputs can tell if the texts were the same. That's the
+    point for passwords, but use normal or stealth mode for messages.
 - **Off:** a normal keyboard.
 
 ### Caps Lock = bypass
 
 While **Caps Lock is on**, Enter works like a normal keyboard: nothing is encrypted or decrypted.
 This beats both the switch and `keycrypt mode`. Turn Caps Lock off and the normal mode is back.
-The Pico's LED goes dark while Caps Lock is on, and `keycrypt status` shows `[CAPS LOCK ON: bypassed]`.
+The Pico's LED stays solid while Caps Lock is on, and `keycrypt status` shows `[CAPS LOCK ON: bypassed]`.
 
 ### Decrypting on the computer
 
@@ -259,6 +277,11 @@ Received some ciphertext? Copy it, then:
 ```bash
 keycrypt decrypt PASTE_CIPHERTEXT_HERE
 ```
+Decrypt figures out the method by itself. For text with no header (password mode, or old
+ciphertext) it tries every key on this computer and every method, and prints only the one whose
+authentication tag checks out, so a wrong guess can never print junk. Decrypt mode on the Pico
+does the same with its own key.
+
 Or pipe in a whole file or chat log. Every ciphertext on each line is decrypted:
 ```bash
 pbpaste | keycrypt decrypt
@@ -280,12 +303,12 @@ keycrypt encrypt "some secret"
 | `keycrypt usbdump` | debug: what the keyboard's media keys / knob send |
 | `keycrypt cipher aes\|chacha\|cascade` | which encryption the device uses |
 | `keycrypt status` | show mode, key, keyboard state, and what the USB port sees |
-| `keycrypt mode encrypt\|decrypt\|stealth\|off\|switch` | set the mode from the computer (`switch` = follow the switch again) |
+| `keycrypt mode encrypt\|decrypt\|stealth\|password\|off\|switch` | set the mode from the computer (`switch` = follow the switch again) |
 | `keycrypt layout us\|uk` | the keyboard layout your computer uses |
 | `keycrypt os mac\|windows\|linux` | your computer's OS |
 | `keycrypt remap win-mac\|win-mac-ctrl\|off` | Windows keyboard on a Mac (see above) |
 | `keycrypt clearkey` | wipe the key from the device |
-| `keycrypt encrypt [--cipher …] TEXT` | encrypt on this computer with your current key |
+| `keycrypt encrypt [--cipher …] [--password] TEXT` | encrypt on this computer with your current key (`--password` = password mode) |
 | `keycrypt decrypt TEXT` | decrypt on this computer (or from stdin) |
 
 Set `KEYCRYPT_PASSPHRASE` in the environment to skip the passphrase prompt (for scripts).
@@ -316,19 +339,29 @@ The header is authenticated (AAD). `Ka = HMAC-SHA256(key, "keycrypt aes")`, `Kc 
 kdf: 1 = scrypt(passphrase, id), 2 = random key, 3 = scrypt(HMAC-SHA256(secret code, passphrase), id); scrypt N=2^17, r=8, p=1.
 Key strings: `KC2-` + base32( type `K`/`C` ‖ kdf ‖ id[16] ‖ key[32] or code[16] ‖ SHA-256 checksum[2] ).
 
+**Password mode** (no header, deterministic): `base64( body )`, body as in v2 but with AAD `"keycrypt-pw"`
+and synthetic nonces instead of random ones: `nonce = HMAC-SHA256(Kn, "a" ‖ plaintext)[:12]` for the aes layer,
+`HMAC-SHA256(Kn, "c" ‖ data)[:12]` for the chacha layer (data = the aes body for cascade),
+`Kn = HMAC-SHA256(key, "keycrypt siv")`. Different texts get different nonces, so nonces never repeat
+for different messages.
+
 **Legacy** (`aes` + PBKDF2 key, and everything before v1.6): `base64( nonce[12] ‖ AES-256-GCM ciphertext ‖ tag[16] )`,
 key = `PBKDF2-HMAC-SHA256(passphrase, salt="keycrypt-v1", 50000 iterations, 32 bytes)`.
 
 ## Build from source
 
+All the source is in this repo, not just the built firmware:
+
+| Path | What it is |
+|---|---|
+| [`firmware/keycrypt/keycrypt.ino`](firmware/keycrypt/keycrypt.ino) | the Pico firmware (all of it: USB passthrough, modes, crypto, serial commands) |
+| [`keycrypt_cli/main.py`](keycrypt_cli/main.py) | the `keycrypt` command |
+| [`scripts/build-firmware.sh`](scripts/build-firmware.sh) | builds the firmware into `keycrypt_cli/firmware/keycrypt.uf2` |
+| [`pyproject.toml`](pyproject.toml) | Python package (installs `keycrypt`) |
+
+Build the firmware yourself (the script installs the pinned board core and libraries the first time):
 ```bash
 brew install arduino-cli
-```
-```bash
-arduino-cli config add board_manager.additional_urls https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
-```
-```bash
-arduino-cli core update-index && arduino-cli core install rp2040:rp2040@6.4.0 && arduino-cli lib install "Pico PIO USB@0.7.3"
 ```
 ```bash
 ./scripts/build-firmware.sh
@@ -336,8 +369,10 @@ arduino-cli core update-index && arduino-cli core install rp2040:rp2040@6.4.0 &&
 ```bash
 keycrypt flash --file build/keycrypt.ino.uf2
 ```
-
-Firmware: [`firmware/keycrypt/keycrypt.ino`](firmware/keycrypt/keycrypt.ino) · CLI: [`keycrypt_cli/main.py`](keycrypt_cli/main.py)
+Install the CLI from your copy of the source:
+```bash
+pipx install --force .
+```
 
 ## Open source
 
