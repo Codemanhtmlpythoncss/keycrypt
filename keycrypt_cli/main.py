@@ -124,6 +124,53 @@ def seal(pt: bytes, key: bytes, cipher: str, kdf: int, kid: bytes = b"") -> str:
     return "k2." + base64.b64encode(hdr + pt).decode()
 
 
+# password mode: no header, no random nonce -> same text + key always gives the same output.
+# nonce = HMAC(Kn, "a"|"c" + data)[:12] (synthetic IV), Kn = HMAC(key, "keycrypt siv"), AAD "keycrypt-pw"
+PW_AAD = b"keycrypt-pw"
+
+
+def _siv(key: bytes, label: bytes, data: bytes) -> bytes:
+    import hmac
+    kn = hmac.new(key, b"keycrypt siv", "sha256").digest()
+    return hmac.new(kn, label + data, "sha256").digest()[:12]
+
+
+def seal_pw(pt: bytes, key: bytes, cipher: str) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+    ka, kc = subkeys(key)
+    if cipher in ("aes", "cascade"):
+        n = _siv(key, b"a", pt)
+        pt = n + AESGCM(ka).encrypt(n, pt, PW_AAD)
+    if cipher in ("chacha", "cascade"):
+        n = _siv(key, b"c", pt)
+        pt = n + ChaCha20Poly1305(kc).encrypt(n, pt, PW_AAD)
+    return base64.b64encode(pt).decode()
+
+
+def open_headerless(raw: bytes, key: bytes):
+    """Tries every headerless method with this key; returns plaintext bytes or None.
+    Each is authenticated, so only the right method + key can pass."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+    from cryptography.exceptions import InvalidTag
+    ka, kc = subkeys(key)
+    for t in (lambda: AESGCM(key).decrypt(raw[:12], raw[12:], None),     # legacy
+              lambda: AESGCM(ka).decrypt(raw[:12], raw[12:], PW_AAD)):   # password aes
+        try:
+            return t()
+        except InvalidTag:
+            pass
+    try:  # outer chacha layer; cascade if what's inside is itself a password-aes layer
+        inner = ChaCha20Poly1305(kc).decrypt(raw[:12], raw[12:], PW_AAD)
+    except InvalidTag:
+        return None
+    if len(inner) >= 28:
+        try:
+            return AESGCM(ka).decrypt(inner[:12], inner[12:], PW_AAD)       # password cascade
+        except InvalidTag:
+            pass
+    return inner                                                         # password chacha
+
+
 class Keys:
     """Finds the key for a ciphertext: keyring first, passphrase only when needed (asked once)."""
     def __init__(self):
@@ -152,12 +199,28 @@ class Keys:
         self.cache[k] = key
         return key
 
+    def candidates(self):
+        """Every key this computer could have used, saved keys first (no passphrase needed)."""
+        for kid, (kdf, key) in self.kr["keys"].items():
+            yield bytes.fromhex(key)
+        yield self.get(0, b"")
+        for kid in self.kr["codes"]:
+            yield self.get(3, bytes.fromhex(kid))
+        for kid in self.kr.get("plain", []):
+            yield self.get(1, bytes.fromhex(kid))
+
 
 def unseal(word: str, keys: Keys) -> str:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
-    if not word.startswith("k2."):
+    if not word.startswith("k2."):  # no header: legacy or password mode -> try every key + method
         raw = base64.b64decode(word, validate=True)
-        return AESGCM(keys.get(0, b"")).decrypt(raw[:12], raw[12:], None).decode()
+        if len(raw) < 28:
+            raise ValueError("too short")
+        for key in keys.candidates():
+            pt = open_headerless(raw, key)
+            if pt is not None:
+                return pt.decode()
+        raise ValueError("no key or method fits")
     raw = base64.b64decode(word[3:], validate=True)
     cipher, kdf = CIPHERS[raw[0]], raw[1]
     if kdf > 3:
@@ -200,7 +263,7 @@ def cmd_encrypt(a):
         else:
             kdf, key = 1, scrypt_key(ask_pass(), kid)
     for pt in items:
-        print(seal(pt.encode(), key, a.cipher, kdf, kid))
+        print(seal_pw(pt.encode(), key, a.cipher) if a.password else seal(pt.encode(), key, a.cipher, kdf, kid))
 
 
 # ---------------------------------------------------------------- device
@@ -265,6 +328,11 @@ def cmd_setkey(a):
         print("making key with scrypt...")
         send_key(scrypt_key(pw, kid), kid, 1)
         remember(kid)  # current key = passphrase-only, nothing secret stored
+        kr = load_keyring()
+        kr.setdefault("plain", [])
+        if kid.hex() not in kr["plain"]:
+            kr["plain"].append(kid.hex())  # just the id (not secret), so decrypt can try it
+        save_keyring(kr)
         return
     # --code
     code = os.urandom(16)
@@ -398,7 +466,7 @@ def main():
     p.set_defaults(f=cmd_cipher)
     sub.add_parser("status", help="show mode, key and keyboard state").set_defaults(f=cmd_status)
     p = sub.add_parser("mode", help="set the mode from here (overrides the switch until 'mode switch')")
-    p.add_argument("mode", choices=["switch", "off", "encrypt", "decrypt", "stealth"])
+    p.add_argument("mode", choices=["switch", "off", "encrypt", "decrypt", "stealth", "password"])
     p.set_defaults(f=cmd_mode)
     p = sub.add_parser("layout", help="keyboard layout the computer uses (us or uk)")
     p.add_argument("layout", choices=["us", "uk"])
@@ -417,6 +485,7 @@ def main():
     p = sub.add_parser("encrypt", help="encrypt text on this computer with your current saved key (args or stdin)")
     p.add_argument("--cipher", choices=CIPHERS, default="aes")
     p.add_argument("--passphrase-only", action="store_true", help="use the old PBKDF2 passphrase key instead")
+    p.add_argument("--password", action="store_true", help="password mode: same text always gives the same output")
     p.add_argument("text", nargs="*")
     p.set_defaults(f=cmd_encrypt)
     p = sub.add_parser("flash", help="install the KeyCrypt firmware on a Pico")
