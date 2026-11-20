@@ -350,14 +350,18 @@ key = `PBKDF2-HMAC-SHA256(passphrase, salt="keycrypt-v1", 50000 iterations, 32 b
 
 ## Build from source
 
+All the source is in this repo, not just the built firmware:
+
+| Path | What it is |
+|---|---|
+| [`firmware/keycrypt/keycrypt.ino`](firmware/keycrypt/keycrypt.ino) | the Pico firmware (all of it: USB passthrough, modes, crypto, serial commands) |
+| [`keycrypt_cli/main.py`](keycrypt_cli/main.py) | the `keycrypt` command |
+| [`scripts/build-firmware.sh`](scripts/build-firmware.sh) | builds the firmware into `keycrypt_cli/firmware/keycrypt.uf2` |
+| [`pyproject.toml`](pyproject.toml) | Python package (installs `keycrypt`) |
+
+Build the firmware yourself (the script installs the pinned board core and libraries the first time):
 ```bash
 brew install arduino-cli
-```
-```bash
-arduino-cli config add board_manager.additional_urls https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
-```
-```bash
-arduino-cli core update-index && arduino-cli core install rp2040:rp2040@6.4.0 && arduino-cli lib install "Pico PIO USB@0.7.3"
 ```
 ```bash
 ./scripts/build-firmware.sh
@@ -365,8 +369,10 @@ arduino-cli core update-index && arduino-cli core install rp2040:rp2040@6.4.0 &&
 ```bash
 keycrypt flash --file build/keycrypt.ino.uf2
 ```
-
-Firmware: [`firmware/keycrypt/keycrypt.ino`](firmware/keycrypt/keycrypt.ino) · CLI: [`keycrypt_cli/main.py`](keycrypt_cli/main.py)
+Install the CLI from your copy of the source:
+```bash
+pipx install --force .
+```
 
 ## Open source
 
